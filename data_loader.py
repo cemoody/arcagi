@@ -86,12 +86,20 @@ class JSONDataset(Dataset[Dict[str, Any]]):
         self.inputs: torch.Tensor = inputs
         self.outputs: torch.Tensor = outputs
 
+        # Create mapping from filename to its index in sorted unique filenames
+        unique_filenames: List[str] = sorted(list(set(filenames)))
+        self.filename_to_index: Dict[str, int] = {
+            filename: idx for idx, filename in enumerate(unique_filenames)
+        }
+
     def __len__(self) -> int:
         return len(self.filenames)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        filename = self.filenames[idx]
         return {
-            "filename": self.filenames[idx],
+            "filename": filename,
+            "filename_index": self.filename_to_index[filename],
             "example_index": self.indices[idx],
             "input_colors_expanded": self.inputs[idx],
             "output_colors_expanded": self.outputs[idx],
@@ -201,12 +209,24 @@ if __name__ == "__main__":
     # Print batch information
     print("\nTrain batch:")
     print(f"  Filenames: {train_batch['filename'][:2]}...")
+    print(f"  Filename indices: {train_batch['filename_index'][:2]}...")
     print(f"  Indices: {train_batch['example_index'][:2]}...")
     print(f"  Inputs shape: {train_batch['input_colors_expanded'].shape}")
     print(f"  Outputs shape: {train_batch['output_colors_expanded'].shape}")
 
     print("\nValidation batch:")
     print(f"  Filenames: {val_batch['filename'][:2]}...")
+    print(f"  Filename indices: {val_batch['filename_index'][:2]}...")
     print(f"  Indices: {val_batch['example_index'][:2]}...")
     print(f"  Inputs shape: {val_batch['input_colors_expanded'].shape}")
     print(f"  Outputs shape: {val_batch['output_colors_expanded'].shape}")
+
+    print("Example batch")
+    data_module = JSONDataModule(
+        train_dir=train_dir, val_dir=val_dir, batch_size=1, num_workers=0
+    )
+
+    # Setup data module
+    data_module.setup()
+    minibatch = next(iter(data_module.train_dataloader()))
+    print(minibatch)
