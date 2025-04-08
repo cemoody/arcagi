@@ -12,16 +12,29 @@ from tqdm import tqdm
 def expand_matrix(matrix: List[List[int]]) -> List[List[int]]:
     """
     Expands a given 2D list (matrix) to a fixed 30x30 matrix.
+    The original matrix is centered within the 30x30 grid.
     Positions beyond the size of the original matrix are filled with -1.
     """
+    # Create empty 30x30 matrix filled with -1
     new_matrix: List[List[int]] = [[-1 for _ in range(30)] for _ in range(30)]
+
+    # Calculate dimensions of input matrix
+    height: int = len(matrix)
+    width: int = len(matrix[0]) if height > 0 else 0
+
+    # Calculate starting positions to center the matrix
+    start_row: int = (30 - height) // 2
+    start_col: int = (30 - width) // 2
+
+    # Copy input matrix to centered position in the new matrix
     for i, row in enumerate(matrix):
-        if i >= 30:
+        if i >= height:
             break
         for j, val in enumerate(row):
-            if j >= 30:
+            if j >= width:
                 break
-            new_matrix[i][j] = val
+            new_matrix[start_row + i][start_col + j] = val
+
     return new_matrix
 
 

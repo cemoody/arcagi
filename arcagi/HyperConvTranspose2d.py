@@ -108,7 +108,7 @@ class HyperConvTranspose2d(nn.ConvTranspose2d):
         Args:
             input: Input tensor of shape [B, in_channels, H, W]
             output_size: Size of the output (unused, kept for compatibility with parent class)
-            condition: Condition tensor of shape [condition_dim]
+            condition: Condition tensor of shape [B, condition_dim]
 
         Returns:
             Output tensor of shape [B, out_channels, H_out, W_out]
@@ -117,29 +117,46 @@ class HyperConvTranspose2d(nn.ConvTranspose2d):
         if condition is None:
             raise ValueError("Condition tensor must be provided")
 
-        # Generate weights from condition
-        params = self.hypernet(condition)
+        # Get batch size
+        batch_size = input.shape[0]
 
-        # Split into weight and bias
-        if self.has_bias:
-            weight_params = params[: self.weight_params]
-            bias_params = params[self.weight_params :]
+        # Ensure condition has correct batch dimension
+        if condition.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch size mismatch: input has {batch_size} but condition has {condition.shape[0]}"
+            )
 
-            # Reshape to proper dimensions
-            weight = weight_params.view(self.weight_shape)
-            bias = bias_params.view(self.bias_shape)
-        else:
-            weight = params.view(self.weight_shape)
-            bias = None
+        # Define a function to process a single item
+        def process_single_item(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+            # Generate weights from condition
+            params = self.hypernet(c)
 
-        # Use F.conv_transpose2d with generated weights
-        return F.conv_transpose2d(
-            input,
-            weight,
-            bias,
-            self.stride,
-            self.padding if isinstance(self.padding, (int, tuple)) else 0,
-            self.output_padding,
-            self.groups,
-            self.dilation,
-        )
+            # Split into weight and bias
+            if self.has_bias:
+                weight_params = params[: self.weight_params]
+                bias_params = params[self.weight_params :]
+
+                # Reshape to proper dimensions
+                weight = weight_params.view(self.weight_shape)
+                bias = bias_params.view(self.bias_shape)
+            else:
+                weight = params.view(self.weight_shape)
+                bias = None
+
+            # Use F.conv_transpose2d with generated weights
+            return F.conv_transpose2d(
+                x.unsqueeze(0),  # Add batch dimension for a single item
+                weight,
+                bias,
+                self.stride,
+                self.padding if isinstance(self.padding, (int, tuple)) else 0,
+                self.output_padding,
+                self.groups,
+                self.dilation,
+            ).squeeze(
+                0
+            )  # Remove batch dimension
+
+        # Use vectorized map operation
+        result: torch.Tensor = torch.vmap(process_single_item)(input, condition)  # type: ignore
+        return result  # type: ignore
