@@ -1,7 +1,7 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Any
+from loguru import logger
 
 # Import with explicit type
 from arcagi.HyperConvTranspose2d import HyperConvTranspose2d
@@ -58,7 +58,8 @@ class CVAE(nn.Module):
     def _build_encoder(self) -> None:
         """Build the encoder part of the network"""
         modules: List[nn.Module] = []
-        in_channels: int = 1  # Single channel for integer inputs
+        # Use n_colors as input channels instead of hardcoding to 1
+        in_channels: int = self.n_colors
 
         for h_dim in self.hidden_dims:
             if self.is_hypernetwork:
@@ -73,7 +74,12 @@ class CVAE(nn.Module):
         self, modules: List[nn.Module], in_channels: int, h_dim: int
     ) -> None:
         """Add a hypernetwork convolutional layer to the encoder"""
-        output_size = self.img_size // (2 * (2 ** len(modules)))
+        # Calculate correct output size based on img_size and how many times we've halved the dimensions
+        current_dim = (
+            self.img_size if len(modules) == 0 else self.img_size // (2 ** len(modules))
+        )
+        output_size = current_dim // 2  # This layer will halve the dimensions
+
         conv_layer = HyperConvTranspose2d(
             in_channels,
             h_dim,
@@ -96,7 +102,12 @@ class CVAE(nn.Module):
         self, modules: List[nn.Module], in_channels: int, h_dim: int
     ) -> None:
         """Add a standard convolutional layer to the encoder"""
-        output_size = self.img_size // (2 * (2 ** len(modules)))
+        # Calculate correct output size based on img_size and how many times we've halved the dimensions
+        current_dim = (
+            self.img_size if len(modules) == 0 else self.img_size // (2 ** len(modules))
+        )
+        output_size = current_dim // 2  # This layer will halve the dimensions
+
         modules.append(
             nn.Sequential(
                 nn.Conv2d(in_channels, h_dim, kernel_size=3, stride=2, padding=1),
@@ -109,24 +120,24 @@ class CVAE(nn.Module):
         """Build the layers for latent space processing"""
         # Linear layers for latent space
         self.condition_encoder = nn.Linear(self.condition_dim, 32)
-        self.fc_mu = nn.Linear(self.flatten_dim + 32, self.latent_dim)
-        self.fc_var = nn.Linear(self.flatten_dim + 32, self.latent_dim)
+
+        # We'll use these as placeholders but rebuild them dynamically in forward pass
+        # based on actual input dimensions
+        self.fc_mu = nn.Linear(1, self.latent_dim)  # Will be rebuilt dynamically
+        self.fc_var = nn.Linear(1, self.latent_dim)  # Will be rebuilt dynamically
 
         # Linear layer from latent space to features
         if self.is_hypernetwork:
-            self.decoder_input = nn.Linear(self.latent_dim, self.flatten_dim)
+            self.decoder_input = nn.Linear(
+                self.latent_dim, 1
+            )  # Will be rebuilt dynamically
         else:
-            self.decoder_input = nn.Linear(self.latent_dim + 32, self.flatten_dim)
+            self.decoder_input = nn.Linear(
+                self.latent_dim + 32, 1
+            )  # Will be rebuilt dynamically
 
-        # Unflatten layer
-        self.unflatten = nn.Unflatten(
-            1,
-            (
-                self.hidden_dims[-1],
-                self.img_size // (2 ** len(self.hidden_dims)),
-                self.img_size // (2 ** len(self.hidden_dims)),
-            ),
-        )
+        # Unflatten layer - will be set dynamically during forward pass
+        self.unflatten = nn.Unflatten(1, (1, 1, 1))  # Placeholder, will be rebuilt
 
     def _build_decoder(self) -> None:
         """Build the decoder part of the network"""
@@ -263,37 +274,220 @@ class CVAE(nn.Module):
         Returns:
             Reconstructed image logits of shape [B, n_colors, H, W]
         """
+        logger.debug(
+            f"Decode input latent shape: {z.shape}, condition shape: {c.shape}"
+        )
+
         if self.is_hypernetwork:
             # Use latent vector directly without concatenating with condition
+            # Get last encoder output shape to determine flatten_dim
+            with torch.no_grad():
+                # Create a dummy input with batch size 1
+                dummy_input = torch.zeros(
+                    1, self.n_colors, self.img_size, self.img_size, device=z.device
+                )
+                dummy_c = torch.zeros(1, self.condition_dim, device=z.device)
+
+                # Run through encoder to get the output dimensions
+                x_dummy = dummy_input
+                for module in self.encoder:
+                    for layer in module.children():
+                        if isinstance(layer, HyperConvTranspose2d):
+                            x_dummy = layer(x_dummy, condition=dummy_c)
+                        elif isinstance(layer, nn.LayerNorm):
+                            # Skip pre-built LayerNorm to avoid shape issues
+                            # We'll apply normalization directly with correct shapes
+                            continue
+                        else:
+                            x_dummy = layer(x_dummy)
+
+                # Calculate flatten_dim from encoder output
+                flatten_dim = torch.flatten(x_dummy, start_dim=1).shape[1]
+
+                # Create dynamic decoder input layer
+                decoder_input = nn.Linear(self.latent_dim, flatten_dim).to(z.device)
+                if (
+                    hasattr(self, "decoder_input")
+                    and self.decoder_input.out_features == flatten_dim
+                ):
+                    # Copy weights if possible
+                    decoder_input.weight.data = self.decoder_input.weight.data
+                    decoder_input.bias.data = self.decoder_input.bias.data
+                self.decoder_input = decoder_input
+
+                # Create dynamic unflatten layer
+                self.unflatten = nn.Unflatten(
+                    1,
+                    (
+                        x_dummy.shape[1],
+                        x_dummy.shape[2],
+                        x_dummy.shape[3],
+                    ),
+                )
+
+            # Now decode
             x = self.decoder_input(z)
+            logger.debug(f"Decoder input after linear layer: {x.shape}")
+
             x = self.unflatten(x)
+            logger.debug(f"After unflatten: {x.shape}")
 
             # Process through decoder except for HyperConvTranspose2d layers
-            for module in self.decoder:
-                # For regular layers
-                for layer in module.children():
-                    if isinstance(layer, HyperConvTranspose2d):
-                        x = layer(x, condition=c)
-                    else:
-                        x = layer(x)
-            # Apply final layer manually
-            for layer in self.final_layer.children():
-                if isinstance(layer, HyperConvTranspose2d):
-                    x = layer(x, condition=c)
+            for i, module in enumerate(self.decoder):
+                # For each module, process layers individually
+                layer_list = list(module.children())
+
+                # Process the conv layer first
+                if isinstance(layer_list[0], HyperConvTranspose2d):
+                    x = layer_list[0](x, condition=c)
                 else:
+                    x = layer_list[0](x)
+
+                # Get current dimensions and apply LayerNorm with correct shape
+                _, curr_channels, curr_height, curr_width = x.shape
+                layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                    x.device
+                )
+                x = layer_norm(x)
+
+                # Process remaining layers (skip original LayerNorm)
+                for layer in layer_list[2:]:
                     x = layer(x)
+
+                logger.debug(f"Decoder module {i} output shape: {x.shape}")
+
+            # Apply final layer manually with dynamic LayerNorm
+            final_layers = list(self.final_layer.children())
+
+            # Process first conv layer
+            if isinstance(final_layers[0], HyperConvTranspose2d):
+                x = final_layers[0](x, condition=c)
+            else:
+                x = final_layers[0](x)
+
+            # Apply dynamic LayerNorm
+            _, curr_channels, curr_height, curr_width = x.shape
+            layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                x.device
+            )
+            x = layer_norm(x)
+
+            # Process remaining layers
+            for layer in final_layers[2:]:
+                x = layer(x)
+
+            logger.debug(f"Final layer output shape: {x.shape}")
         else:
             # Encode condition
             c_encoded = self.condition_encoder(c)
+            logger.debug(f"Encoded condition shape: {c_encoded.shape}")
 
             # Combine latent with condition
             z_c = torch.cat([z, c_encoded], dim=1)
+            logger.debug(f"Combined latent+condition shape: {z_c.shape}")
+
+            # Get last encoder output shape to determine flatten_dim
+            with torch.no_grad():
+                # Create a dummy input with batch size 1
+                dummy_input = torch.zeros(
+                    1, self.n_colors, self.img_size, self.img_size, device=z.device
+                )
+
+                # Run through encoder to get the output dimensions
+                x_dummy = dummy_input
+                for module in self.encoder:
+                    for layer in module.children():
+                        if isinstance(layer, nn.LayerNorm):
+                            # Skip pre-built LayerNorm to avoid shape issues
+                            continue
+                        else:
+                            x_dummy = layer(x_dummy)
+
+                # Calculate flatten_dim from encoder output
+                flatten_dim = torch.flatten(x_dummy, start_dim=1).shape[1]
+
+                # Create dynamic decoder input layer
+                decoder_input = nn.Linear(self.latent_dim + 32, flatten_dim).to(
+                    z.device
+                )
+                if (
+                    hasattr(self, "decoder_input")
+                    and self.decoder_input.out_features == flatten_dim
+                ):
+                    # Copy weights if possible
+                    decoder_input.weight.data = self.decoder_input.weight.data
+                    decoder_input.bias.data = self.decoder_input.bias.data
+                self.decoder_input = decoder_input
+
+                # Create dynamic unflatten layer
+                self.unflatten = nn.Unflatten(
+                    1,
+                    (
+                        x_dummy.shape[1],
+                        x_dummy.shape[2],
+                        x_dummy.shape[3],
+                    ),
+                )
 
             # Decode
             x = self.decoder_input(z_c)
+            logger.debug(f"After decoder input linear: {x.shape}")
+
             x = self.unflatten(x)
-            x = self.decoder(x)
-            x = self.final_layer(x)
+            logger.debug(f"After unflatten: {x.shape}")
+
+            # Process through decoder with dynamic LayerNorm
+            for i, module_idx in enumerate(range(len(self.decoder))):
+                module = self.decoder[module_idx]
+
+                # For each module, process layers individually
+                layer_list = list(module.children())
+
+                # Process the conv layer first
+                x = layer_list[0](x)
+
+                # Get current dimensions and apply LayerNorm with correct shape
+                _, curr_channels, curr_height, curr_width = x.shape
+                layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                    x.device
+                )
+                x = layer_norm(x)
+
+                # Process remaining layers (skip original LayerNorm)
+                for layer in layer_list[2:]:
+                    x = layer(x)
+
+                logger.debug(f"Decoder module {i} output shape: {x.shape}")
+
+            # Apply final layer with dynamic LayerNorm
+            final_layers = list(self.final_layer.children())
+
+            # Process first conv layer
+            x = final_layers[0](x)
+
+            # Apply dynamic LayerNorm
+            _, curr_channels, curr_height, curr_width = x.shape
+            layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                x.device
+            )
+            x = layer_norm(x)
+
+            # Process remaining layers
+            for layer in final_layers[2:]:
+                x = layer(x)
+
+            logger.debug(f"Final output shape: {x.shape}")
+
+        # Ensure output size is exactly img_size x img_size
+        # This handles any size mismatches from the transposed convolutions
+        if x.shape[2] != self.img_size or x.shape[3] != self.img_size:
+            # Use resize to ensure exact output size
+            x = F.interpolate(
+                x,
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
 
         return x
 
@@ -304,38 +498,105 @@ class CVAE(nn.Module):
         Encodes the input image x and condition c into latent space.
 
         Args:
-            x: Input tensor of shape [B, 1, H, W]
+            x: Input tensor of shape [B, channels, H, W]
             c: Condition tensor of shape [B, condition_dim]
 
         Returns:
             mu: Mean of the latent distribution
             log_var: Log variance of the latent distribution
         """
+        logger.debug(f"Encode input shape: {x.shape}, condition shape: {c.shape}")
+
+        # Get actual input dimensions
+        _, _, height, width = x.shape
+
         # Encode image
         if self.is_hypernetwork:
             # Process through encoder manually for HyperConvTranspose2d layers
             encoded_x = x  # Start with input tensor
-            for module in self.encoder:
-                for layer in module.children():
-                    if isinstance(layer, HyperConvTranspose2d):
-                        encoded_x = layer(encoded_x, condition=c)
-                    else:
-                        encoded_x = layer(encoded_x)
+            for i, module in enumerate(self.encoder):
+                # For the LayerNorm layers, we need to adjust the expected dimensions
+                layer_list = list(module.children())
+
+                # Process the conv layer first
+                if isinstance(layer_list[0], HyperConvTranspose2d):
+                    encoded_x = layer_list[0](encoded_x, condition=c)
+                else:
+                    encoded_x = layer_list[0](encoded_x)
+
+                # Get the current output dimensions
+                _, curr_channels, curr_height, curr_width = encoded_x.shape
+
+                # Create a new LayerNorm with the correct dimensions
+                layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                    encoded_x.device
+                )
+
+                # Process through the new layer_norm and remaining layers
+                encoded_x = layer_norm(encoded_x)
+                for layer in layer_list[2:]:  # Skip the original LayerNorm
+                    encoded_x = layer(encoded_x)
+
+                logger.debug(f"Encoder layer {i} output shape: {encoded_x.shape}")
             x = encoded_x
         else:
-            x = self.encoder(x)
+            for i, module_idx in enumerate(range(len(self.encoder))):
+                module = self.encoder[module_idx]
+
+                # For the LayerNorm layers, we need to adjust the expected dimensions
+                layer_list = list(module.children())
+
+                # Process the conv layer first
+                x = layer_list[0](x)
+
+                # Get the current output dimensions
+                _, curr_channels, curr_height, curr_width = x.shape
+
+                # Create a new LayerNorm with the correct dimensions
+                layer_norm = nn.LayerNorm([curr_channels, curr_height, curr_width]).to(
+                    x.device
+                )
+
+                # Process through the new layer_norm and remaining layers
+                x = layer_norm(x)
+                for layer in layer_list[2:]:  # Skip the original LayerNorm
+                    x = layer(x)
+
+                logger.debug(f"Encoder module {i} output shape: {x.shape}")
 
         x = torch.flatten(x, start_dim=1)
+        logger.debug(f"Flattened encoder output shape: {x.shape}")
 
         # Encode condition
         c_encoded = self.condition_encoder(c)
+        logger.debug(f"Encoded condition shape: {c_encoded.shape}")
 
         # Combine image features with condition
         x_c = torch.cat([x, c_encoded], dim=1)
+        logger.debug(f"Combined features shape: {x_c.shape}")
+
+        # Get actual flatten dimension
+        flatten_dim = x_c.shape[1]
+
+        # Create dynamic mu and var encoders
+        fc_mu = nn.Linear(flatten_dim, self.latent_dim).to(x.device)
+        fc_var = nn.Linear(flatten_dim, self.latent_dim).to(x.device)
+
+        # Initialize with same weights if possible (for consistency with pretrained models)
+        if self.fc_mu.in_features == flatten_dim:
+            fc_mu.weight.data = self.fc_mu.weight.data
+            fc_mu.bias.data = self.fc_mu.bias.data
+            fc_var.weight.data = self.fc_var.weight.data
+            fc_var.bias.data = self.fc_var.bias.data
+
+        # Update model's layers for future use
+        self.fc_mu = fc_mu
+        self.fc_var = fc_var
 
         # Get latent distribution parameters
         mu = self.fc_mu(x_c)
         log_var = self.fc_var(x_c)
+        logger.debug(f"Latent mu shape: {mu.shape}, log_var shape: {log_var.shape}")
 
         return mu, log_var
 
@@ -353,6 +614,7 @@ class CVAE(nn.Module):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         z = mu + eps * std
+        logger.debug(f"Reparameterized latent shape: {z.shape}")
         return z
 
     def forward(
@@ -370,10 +632,13 @@ class CVAE(nn.Module):
             mu: Mean of the latent distribution
             log_var: Log variance of the latent distribution
         """
+        logger.debug(f"Forward input shape: {x.shape}, condition shape: {c.shape}")
+
         mu, log_var = self.encode(x, c)
         z = self.reparameterize(mu, log_var)
         x_recon = self.decode(z, c)
 
+        logger.debug(f"Forward output shape: {x_recon.shape}")
         return x_recon, mu, log_var
 
     def transform_image(
@@ -464,15 +729,21 @@ def preprocess_int_array(int_array: torch.Tensor) -> torch.Tensor:
         int_array = torch.tensor(int_array, dtype=torch.float32)
 
     # Ensure 2D array is shaped [Batch, 1, Height, Width]
+    original_shape = int_array.shape
     if len(int_array.shape) == 2:
         # Single image: [H, W] -> [1, 1, H, W]
-        return int_array.unsqueeze(0).unsqueeze(0)
+        result = int_array.unsqueeze(0).unsqueeze(0)
     elif len(int_array.shape) == 3:
         # Batch of images: [B, H, W] -> [B, 1, H, W]
-        return int_array.unsqueeze(1)
+        result = int_array.unsqueeze(1)
     else:
         # Already in correct format
-        return int_array
+        result = int_array
+
+    logger.debug(
+        f"Preprocessed int array from shape {original_shape} to {result.shape}"
+    )
+    return result
 
 
 def postprocess_to_ints(logits: torch.Tensor) -> torch.Tensor:
@@ -490,12 +761,19 @@ def postprocess_to_ints(logits: torch.Tensor) -> torch.Tensor:
     # Output shape: [B, H, W] with integer values
     probs = F.softmax(logits, dim=1)
     _, indices = torch.max(probs, dim=1)
+    logger.debug(f"Postprocessed from shape {logits.shape} to {indices.shape}")
     return indices
 
 
 if __name__ == "__main__":
     import torch
     import torch.nn.functional as F
+
+    # Configure logger to show debug messages
+    logger.remove()
+    logger.add(lambda msg: print(msg), level="DEBUG")
+
+    logger.info("Starting model test with 30x30 input")
 
     # Initialize the model
     model = CVAE(
@@ -510,6 +788,7 @@ if __name__ == "__main__":
     # Sample data from the context
     # Extract input and output colors from the sample data
     input_colors = torch.ones(1, 17, 30, dtype=torch.int32)
+    logger.debug(f"Original input shape: {input_colors.shape}")
 
     # Create a condition tensor (can be any value for testing)
     condition: torch.Tensor = torch.tensor([[0.5]])
@@ -528,15 +807,17 @@ if __name__ == "__main__":
     # Convert to one-hot encoding
     one_hot_input = F.one_hot(valid_input.long(), num_classes=11).float()
     one_hot_input = one_hot_input.squeeze(1).permute(0, 3, 1, 2)
+    logger.debug(f"One-hot encoded input shape: {one_hot_input.shape}")
 
     # Run a forward pass
+    logger.info("Running forward pass")
     reconstructed, mu, log_var = model(one_hot_input, condition)
 
     # Convert output back to integers
     output_ints = postprocess_to_ints(reconstructed)
 
-    print("Model initialized and forward pass completed")
-    print(f"Input shape: {input_colors.shape}")
-    print(f"Output shape: {output_ints.shape}")
-    print(f"Mean vector shape: {mu.shape}")
-    print(f"Log variance shape: {log_var.shape}")
+    logger.info("Model initialized and forward pass completed")
+    logger.info(f"Input shape: {input_colors.shape}")
+    logger.info(f"Output shape: {output_ints.shape}")
+    logger.info(f"Mean vector shape: {mu.shape}")
+    logger.info(f"Log variance shape: {log_var.shape}")
