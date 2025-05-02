@@ -1,245 +1,243 @@
-#!/usr/bin/env python3
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast, Sized
-
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset
-import pytorch_lightning as pl
-from tqdm import tqdm
+from typing import Tuple, List
 
 
-def expand_matrix(matrix: List[List[int]]) -> List[List[int]]:
-    """
-    Expands a given 2D list (matrix) to a fixed 30x30 matrix.
-    The original matrix is centered within the 30x30 grid.
-    Positions beyond the size of the original matrix are filled with -1.
-    """
-    # Create empty 30x30 matrix filled with -1
-    new_matrix: List[List[int]] = [[-1 for _ in range(30)] for _ in range(30)]
-
-    # Calculate dimensions of input matrix
-    height: int = len(matrix)
-    width: int = len(matrix[0]) if height > 0 else 0
-
-    # Calculate starting positions to center the matrix
-    start_row: int = (30 - height) // 2
-    start_col: int = (30 - width) // 2
-
-    # Copy input matrix to centered position in the new matrix
-    for i, row in enumerate(matrix):
-        if i >= height:
-            break
-        for j, val in enumerate(row):
-            if j >= width:
-                break
-            new_matrix[start_row + i][start_col + j] = val
-
-    return new_matrix
-
-
-def load_data_from_directory(
-    directory: str, subset: str
+def load_parquet_data(
+    parquet_path: str,
 ) -> Tuple[List[str], List[int], torch.Tensor, torch.Tensor]:
     """
-    Loads JSON files from a given directory.
-    For each JSON file, it reads the list of examples under the key `subset`
-    (e.g., "train" or "test"), expands the input and output matrices,
-    and aggregates the data.
+    Loads data from a parquet file created by preprocess.py and creates PyTorch arrays.
+    """
+    # Load the parquet file
+    df: pd.DataFrame = pd.read_parquet(parquet_path)
+
+    # Extract filenames and indices
+    filenames: List[str] = df["filename"].tolist()
+    indices: List[int] = df["index"].tolist()
+
+    # Get number of examples
+    num_examples: int = len(df)
+
+    # Initialize raw tensors
+    inputs_raw: torch.Tensor = torch.full((num_examples, 30, 30), -1, dtype=torch.int)
+    outputs_raw: torch.Tensor = torch.full((num_examples, 30, 30), -1, dtype=torch.int)
+
+    # Fill tensors with values from DataFrame
+    for i in range(30):
+        for j in range(30):
+            inputs_raw[:, i, j] = torch.tensor(
+                df[f"input_{i}_{j}"].values, dtype=torch.int
+            )
+            outputs_raw[:, i, j] = torch.tensor(
+                df[f"output_{i}_{j}"].values, dtype=torch.int
+            )
+
+    # Create one-hot encoded tensors for colors 0-10
+    inputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float)
+    outputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float)
+
+    # Fill in one-hot encoded values
+    for color in range(11):
+        inputs[:, :, :, color] = (inputs_raw == color).float()
+        outputs[:, :, :, color] = (outputs_raw == color).float()
+
+    return filenames, indices, inputs, outputs
+
+
+def generate_color_mapping(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates a random one-to-one mapping for colors 0-10 (excluding -1) and applies it to the input tensors.
+    """
+    assert inputs.shape == outputs.shape
+    assert inputs.shape[0] == 30
+    assert inputs.shape[1] == 30
+
+    # Turn inputs into a one-hot 3 dimensional array
+
+    # Generate a random permutation of colors 0 to 10
+    colors: torch.Tensor = torch.arange(11)
+    color_mapping: torch.Tensor = colors[torch.randperm(11)]
+
+    # Initialize new tensors
+    new_inputs: torch.Tensor = torch.zeros_like(inputs)
+    new_outputs: torch.Tensor = torch.zeros_like(outputs)
+
+    # Permute the color channels - efficient vectorized operation
+    for old_color in range(11):
+        new_color = int(color_mapping[old_color].item())
+        new_inputs[:, :, new_color] = inputs[:, :, old_color]
+        new_outputs[:, :, new_color] = outputs[:, :, old_color]
+    return new_inputs, new_outputs
+
+
+def one_hot_to_categorical(one_hot_tensor: torch.Tensor) -> torch.Tensor:
+    # Get the indices of the maximum values along the last dimension
+    cat: torch.Tensor = torch.argmax(one_hot_tensor, dim=-1)
+    sum: torch.Tensor = one_hot_tensor.sum(dim=-1)
+    cat[sum == 0] = -1
+    return cat
+
+
+# ---------------------------------------------------------------------------
+# Color permutation utilities
+# ---------------------------------------------------------------------------
+
+
+def batch_generate_color_mapping(
+    inputs: torch.Tensor, outputs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply an independent random permutation of the 11 colour channels (0-10)
+    to *each* example in a batch.
+
+    The permutation for a given sample is shared between its ``inputs`` and
+    ``outputs`` so that the mapping is aligned.  All permutations are mutually
+    independent across the batch.
+
+    Args:
+        inputs:  A tensor of shape ``(B, H, W, 11)`` containing one-hot encoded
+            colours for *B* samples.
+        outputs: Tensor with the same shape as ``inputs``.
 
     Returns:
-        filenames: List of filenames (one per example).
-        indices: List of example indices (per file).
-        inputs_tensor: A 3D tensor of expanded input colors (N, 30, 30).
-        outputs_tensor: A 3D tensor of expanded output colors (N, 30, 30).
-    """
-    filenames: List[str] = []
-    indices: List[int] = []
-    inputs_expanded: List[List[List[int]]] = []  # Each inner element is 30x30.
-    outputs_expanded: List[List[List[int]]] = []
-
-    path: Path = Path(directory)
-    json_files: List[Path] = sorted(list(path.glob("*.json")))
-
-    for json_file in tqdm(json_files):
-        with json_file.open("r") as f:
-            data: Dict[str, Any] = json.load(f)
-        if subset not in data:
-            raise ValueError(f"File {json_file.name} does not have the '{subset}' key.")
-        examples: List[Dict[str, Any]] = data[subset]
-        for idx, example in enumerate(examples):
-            filenames.append(json_file.name)
-            indices.append(idx)
-            input_colors: List[List[int]] = example["input"]
-            output_colors: List[List[int]] = example["output"]
-            inputs_expanded.append(expand_matrix(input_colors))
-            outputs_expanded.append(expand_matrix(output_colors))
-
-    inputs_tensor: torch.Tensor = torch.tensor(inputs_expanded, dtype=torch.int)
-    outputs_tensor: torch.Tensor = torch.tensor(outputs_expanded, dtype=torch.int)
-
-    return filenames, indices, inputs_tensor, outputs_tensor
-
-
-class JSONDataset(Dataset[Dict[str, Any]]):
-    """
-    A PyTorch Dataset that holds data (filenames, example indices,
-    expanded input colors, and expanded output colors) loaded from JSON files.
+        Tuple containing the permuted ``inputs`` and ``outputs`` (same shape as
+        the originals).
     """
 
-    def __init__(
-        self,
-        filenames: List[str],
-        indices: List[int],
-        inputs: torch.Tensor,
-        outputs: torch.Tensor,
-    ) -> None:
-        self.filenames: List[str] = filenames
-        self.indices: List[int] = indices
-        self.inputs: torch.Tensor = inputs
-        self.outputs: torch.Tensor = outputs
+    # Basic validation – we expect one-hot encoded channels on the last axis.
+    assert (
+        inputs.shape == outputs.shape
+    ), "inputs and outputs must have identical shapes"
+    assert inputs.dim() == 4, "Expected inputs with shape (B, H, W, 11)"
+    batch_size: int
+    height: int
+    width: int
+    channels: int
+    batch_size, height, width, channels = inputs.shape
+    assert channels == 11, "Colour channel dimension (last dim) must be 11"
 
-        # Create mapping from filename to its index in sorted unique filenames
-        unique_filenames: List[str] = sorted(list(set(filenames)))
-        self.filename_to_index: Dict[str, int] = {
-            filename: idx for idx, filename in enumerate(unique_filenames)
-        }
+    # ---------------------------------------------------------------------
+    # Generate a *vectorised* set of independent random permutations.
+    # ---------------------------------------------------------------------
+    # Draw random values and argsort – this produces a random permutation for
+    # every sample without an explicit Python loop, keeping the operation on
+    # the GPU when available.
+    perm: torch.Tensor = torch.argsort(
+        torch.rand(batch_size, channels, device=inputs.device), dim=1
+    )
 
-    def __len__(self) -> int:
-        return len(self.filenames)
+    # ---------------------------------------------------------------------
+    # Re-index the colour channel using ``torch.gather``.
+    # ---------------------------------------------------------------------
+    # Move channel axis to dim=1 for easier gathering.
+    inputs_bchw: torch.Tensor = inputs.permute(0, 3, 1, 2)  # (B, C, H, W)
+    outputs_bchw: torch.Tensor = outputs.permute(0, 3, 1, 2)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        filename = self.filenames[idx]
-        return {
-            "filename": filename,
-            "filename_index": self.filename_to_index[filename],
-            "example_index": self.indices[idx],
-            "input_colors_expanded": self.inputs[idx],
-            "output_colors_expanded": self.outputs[idx],
-        }
+    # Expand perm so it can index the (H, W) spatial dimensions.
+    perm_expanded: torch.Tensor = perm[:, :, None, None].expand(-1, -1, height, width)
+
+    # Gather along the channel dimension.
+    permuted_inputs_bchw: torch.Tensor = torch.gather(inputs_bchw, 1, perm_expanded)
+    permuted_outputs_bchw: torch.Tensor = torch.gather(outputs_bchw, 1, perm_expanded)
+
+    # Restore original layout (B, H, W, C).
+    permuted_inputs: torch.Tensor = permuted_inputs_bchw.permute(0, 2, 3, 1)
+    permuted_outputs: torch.Tensor = permuted_outputs_bchw.permute(0, 2, 3, 1)
+
+    return permuted_inputs, permuted_outputs
 
 
-class JSONDataModule(pl.LightningDataModule):
+def repeat_and_permute(
+    inputs: torch.Tensor, outputs: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    A PyTorch Lightning DataModule that loads JSON data from directories.
-    It supports separate directories for training and validation.
+    Repeats the input and output tensors n times along the batch dimension and applies
+    independent color permutations to each sample.
+
+    Args:
+        inputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
+        outputs: A tensor with the same shape as inputs.
+        n: Number of times to repeat each sample.
+
+    Returns:
+        Tuple containing the repeated and permuted inputs and outputs with shape (B*n, 30, 30, 11).
     """
+    # Repeat each sample n times
+    repeated_inputs: torch.Tensor = inputs.repeat(n, 1, 1, 1)
+    repeated_outputs: torch.Tensor = outputs.repeat(n, 1, 1, 1)
 
-    def __init__(
-        self,
-        train_dir: Optional[str] = None,
-        val_dir: Optional[str] = None,
-        batch_size: int = 32,
-        num_workers: int = 0,
-    ) -> None:
-        super().__init__()
-        self.train_dir: Optional[str] = train_dir
-        self.val_dir: Optional[str] = val_dir
-        self.batch_size: int = batch_size
-        self.num_workers: int = num_workers
+    # Apply independent color permutations to each sample
+    permuted_inputs, permuted_outputs = batch_generate_color_mapping(
+        repeated_inputs, repeated_outputs
+    )
 
-        self.train_dataset: Optional[Dataset[Dict[str, Any]]] = None
-        self.val_dataset: Optional[Dataset[Dict[str, Any]]] = None
-
-        # Define which subset key to load for each dataset.
-        self.train_subset: str = "train"
-        self.val_subset: str = (
-            "test"  # Change this if your validation key is named differently.
-        )
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        if self.train_dir is not None:
-            filenames, indices, inputs, outputs = load_data_from_directory(
-                self.train_dir, self.train_subset
-            )
-            self.train_dataset = JSONDataset(filenames, indices, inputs, outputs)
-        if self.val_dir is not None:
-            filenames, indices, inputs, outputs = load_data_from_directory(
-                self.val_dir, self.val_subset
-            )
-            self.val_dataset = JSONDataset(filenames, indices, inputs, outputs)
-
-    def train_dataloader(self) -> DataLoader[Dict[str, Any]]:
-        if self.train_dataset is None:
-            raise ValueError(
-                "Train dataset is not loaded. Ensure 'train_dir' is provided and 'setup()' has been called."
-            )
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-        )
-
-    def val_dataloader(self) -> DataLoader[Dict[str, Any]]:
-        if self.val_dataset is None:
-            raise ValueError(
-                "Validation dataset is not loaded. Ensure 'val_dir' is provided and 'setup()' has been called."
-            )
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-        )
+    return permuted_inputs, permuted_outputs
 
 
-# Example usage
 if __name__ == "__main__":
+    import argparse
 
-    # Set paths to data directories
-    train_dir: str = "ARC-AGI/data/training"
-    val_dir: str = "ARC-AGI/data/evaluation"
-
-    # Check if directories exist
-    if not Path(train_dir).exists():
-        print(f"Warning: Training directory {train_dir} does not exist")
-    if not Path(val_dir).exists():
-        print(f"Warning: Evaluation directory {val_dir} does not exist")
-
-    # Create data module
-    data_module = JSONDataModule(
-        train_dir=train_dir, val_dir=val_dir, batch_size=32, num_workers=0
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Load and display information about processed data"
     )
-
-    # Setup data module
-    data_module.setup()
-
-    # Get data loaders
-    train_loader = data_module.train_dataloader()
-    val_loader = data_module.val_dataloader()
-
-    # Print dataset information
-    assert data_module.train_dataset is not None, "Train dataset not loaded"
-    assert data_module.val_dataset is not None, "Validation dataset not loaded"
-    print(f"Train dataset size: {len(cast(Sized, data_module.train_dataset))}")
-    print(f"Validation dataset size: {len(cast(Sized, data_module.val_dataset))}")
-
-    # Get a batch from each loader
-    train_batch = next(iter(train_loader))
-    val_batch = next(iter(val_loader))
-
-    # Print batch information
-    print("\nTrain batch:")
-    print(f"  Filenames: {train_batch['filename'][:2]}...")
-    print(f"  Filename indices: {train_batch['filename_index'][:2]}...")
-    print(f"  Indices: {train_batch['example_index'][:2]}...")
-    print(f"  Inputs shape: {train_batch['input_colors_expanded'].shape}")
-    print(f"  Outputs shape: {train_batch['output_colors_expanded'].shape}")
-
-    print("\nValidation batch:")
-    print(f"  Filenames: {val_batch['filename'][:2]}...")
-    print(f"  Filename indices: {val_batch['filename_index'][:2]}...")
-    print(f"  Indices: {val_batch['example_index'][:2]}...")
-    print(f"  Inputs shape: {val_batch['input_colors_expanded'].shape}")
-    print(f"  Outputs shape: {val_batch['output_colors_expanded'].shape}")
-
-    print("Example batch")
-    data_module = JSONDataModule(
-        train_dir=train_dir, val_dir=val_dir, batch_size=1, num_workers=0
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="processed_data/train.parquet",
+        help="Path to the processed parquet file",
     )
+    parser.add_argument(
+        "--filename",
+        type=str,
+        default="025d127b.json",
+        help="Filter examples by filename",
+    )
+    args = parser.parse_args()
 
-    # Setup data module
-    data_module.setup()
-    minibatch = next(iter(data_module.train_dataloader()))
-    print(minibatch)
+    # Load the data
+    filenames, indices, inputs, outputs = load_parquet_data(args.data_path)
+
+    binputs, boutputs = repeat_and_permute(inputs, outputs, 5)
+
+    # Print shape information
+    print(f"Number of examples: {len(filenames)}")
+    print(f"Filenames: {len(filenames)} items")
+    print(f"Indices: {len(indices)} items")
+    print(f"Inputs shape: {inputs.shape}")
+    print(f"Outputs shape: {outputs.shape}")
+
+    # Late import of terminal_imshow
+    from utils.terminal_imshow import imshow
+
+    # Filter examples by filename if provided
+    if args.filename:
+        filtered_indices: list[int] = [
+            i for i, fname in enumerate(filenames) if fname == args.filename
+        ]
+
+        # Get the first matching example
+        idx: int = filtered_indices[0]
+        print(f"\nShowing example for {args.filename} (index {idx}):")
+
+        # Display original input and output
+        print("\nOriginal Input:")
+
+        imshow(one_hot_to_categorical(inputs[idx]))
+        print("\nOriginal Output:")
+        imshow(one_hot_to_categorical(outputs[idx]))
+
+        # Find the corresponding indices in the permuted batch
+        # Each original example is repeated n times (5 in this case)
+        batch_indices: list[int] = [idx + i * len(filenames) for i in range(5)]
+
+        # Display all permuted versions
+        for i, batch_idx in enumerate(batch_indices):
+            print(f"\nPermuted version {i+1}:")
+            print("Input:")
+            imshow(one_hot_to_categorical(binputs[batch_idx]))
+            print("Output:")
+            imshow(one_hot_to_categorical(boutputs[batch_idx]))

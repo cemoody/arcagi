@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 
-def print_mat(
+def imshow(
     matrix: torch.Tensor, title: Optional[str] = None, show_legend: bool = True
 ) -> None:
     """
@@ -96,7 +96,7 @@ def print_mat(
 if __name__ == "__main__":
     # Test with random color grid
     random_grid = torch.randint(0, 10, (10, 10))
-    print_mat(random_grid, title="Random Color Grid (10x10)")
+    imshow(random_grid, title="Random Color Grid (10x10)")
 
     # Test with a checkerboard pattern
     size: int = 8
@@ -104,20 +104,20 @@ if __name__ == "__main__":
     for i in range(size):
         for j in range(size):
             checkerboard[i, j] = (i + j) % 2
-    print_mat(checkerboard, title="Checkerboard Pattern (8x8)")
+    imshow(checkerboard, title="Checkerboard Pattern (8x8)")
 
     # Test with a gradient pattern
     gradient = torch.zeros((15, 15), dtype=torch.int)
     for i in range(15):
         for j in range(15):
             gradient[i, j] = (i + j) % 16
-    print_mat(gradient, title="Color Gradient (15x15)")
+    imshow(gradient, title="Color Gradient (15x15)")
 
     # Test with -1 values (should be rendered as empty space)
     with_background = torch.ones((10, 10), dtype=torch.int)
     with_background[3:7, 3:7] = 2
     with_background[0:10:3, 0:10:3] = -1
-    print_mat(with_background, title="Pattern with Background (-1 values)")
+    imshow(with_background, title="Pattern with Background (-1 values)")
 
     # Test with a larger 30x30 matrix (similar to what's used in the ARC dataset)
     large_matrix = torch.full((30, 30), -1, dtype=torch.int)
@@ -125,53 +125,50 @@ if __name__ == "__main__":
     large_matrix[10:20, 10:20] = 3
     large_matrix[13:17, 13:17] = 5
     large_matrix[14:16, 14:16] = 7
-    print_mat(large_matrix, title="30x30 Matrix with Pattern in Center")
+    imshow(large_matrix, title="30x30 Matrix with Pattern in Center")
 
     # Try to load and display a real ARC example if the data_loader is available
-    try:
-        # Add parent directory to path so we can import data_loader
-        project_root = Path(__file__).parent.parent.parent
-        sys.path.append(str(project_root))
-        from arcagi.data_loader import JSONDataModule
+    # Add parent directory to path so we can import data_loader
+    project_root = Path(__file__).parent.parent.parent
+    sys.path.append(str(project_root))
+    from arcagi.data_loader import JSONDataModule
 
-        # Look for the data directory
-        possible_data_dirs = [
-            project_root / "ARC-AGI" / "data" / "training",
-            project_root / "ARC-AGI-2" / "data" / "training",
-            project_root / "data" / "training",
-        ]
+    # Look for the data directory
+    possible_data_dirs = [
+        project_root / "ARC-AGI" / "data" / "training",
+        project_root / "ARC-AGI-2" / "data" / "training",
+        project_root / "data" / "training",
+    ]
 
-        train_dir = None
-        for data_dir in possible_data_dirs:
-            if data_dir.exists():
-                train_dir = str(data_dir)
-                break
+    train_dir = None
+    for data_dir in possible_data_dirs:
+        if data_dir.exists():
+            train_dir = str(data_dir)
+            break
 
-        # Check if directory exists
-        if train_dir is not None:
-            print(f"\nFound ARC dataset at: {train_dir}")
-            data_module = JSONDataModule(train_dir=train_dir, batch_size=1)
-            data_module.setup()
+    # Check if directory exists
+    if train_dir is not None:
+        print(f"\nFound ARC dataset at: {train_dir}")
+        data_module = JSONDataModule(train_dir=train_dir, batch_size=1)
+        data_module.setup()
 
-            # Get a batch from the dataloader
-            train_loader = data_module.train_dataloader()
-            batch = next(iter(train_loader))
+        # Get a batch from the dataloader
+        train_loader = data_module.train_dataloader()
+        batch = next(iter(train_loader))
 
-            # Display input and output
-            input_tensor = batch["input_colors_expanded"][0]
-            output_tensor = batch["output_colors_expanded"][0]
+        # Display input and output
+        input_tensor = batch["input_colors_expanded"][0]
+        output_tensor = batch["output_colors_expanded"][0]
 
-            print("\n\033[1m========== Real ARC Example ==========\033[0m")
-            print(
-                f"\033[1mFrom file: {batch['filename'][0]}, Example {batch['example_index'][0]}\033[0m"
-            )
+        print("\n\033[1m========== Real ARC Example ==========\033[0m")
+        print(
+            f"\033[1mFrom file: {batch['filename'][0]}, Example {batch['example_index'][0]}\033[0m"
+        )
 
-            print_mat(input_tensor, title="Input")
-            print_mat(output_tensor, title="Expected Output")
-        else:
-            print("\nARC dataset not found. Skipping real example visualization.")
-            print("Expected to find the dataset in one of:")
-            for path in possible_data_dirs:
-                print(f"  - {path}")
-    except (ImportError, ModuleNotFoundError, Exception) as e:
-        print(f"\nError loading ARC example: {e}")
+        imshow(input_tensor, title="Input")
+        imshow(output_tensor, title="Expected Output")
+    else:
+        print("\nARC dataset not found. Skipping real example visualization.")
+        print("Expected to find the dataset in one of:")
+        for path in possible_data_dirs:
+            print(f"  - {path}")

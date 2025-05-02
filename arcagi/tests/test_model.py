@@ -116,3 +116,48 @@ def test_channel_mismatch_error():
     assert reconstructed.shape == (1, n_colors, img_size, img_size)
     assert mu.shape == (1, latent_dim)
     assert log_var.shape == (1, latent_dim)
+
+
+@pytest.mark.parametrize("is_hypernetwork", [False, True])
+def test__forward__matches_expected_shape(is_hypernetwork: bool):
+    """Test that the model forward pass produces outputs with expected shapes."""
+    # Arrange
+    img_size = 30
+    n_colors = 11
+    latent_dim = 64
+    condition_dim = 1
+    batch_size = 2
+
+    # Initialize the model with the specified hypernetwork setting
+    model = CVAE(
+        img_size=img_size,
+        n_colors=n_colors,
+        latent_dim=latent_dim,
+        condition_dim=condition_dim,
+        is_hypernetwork=is_hypernetwork,
+    )
+
+    # Create input tensor with expected shape
+    input_tensor: torch.Tensor = torch.rand(batch_size, n_colors, img_size, img_size)
+
+    # Create condition tensor
+    condition: torch.Tensor = torch.rand(batch_size, condition_dim)
+
+    # Act - perform forward pass
+    reconstructed, mu, log_var = model(input_tensor, condition)
+
+    # Assert - check output shapes
+    assert reconstructed.shape == (
+        batch_size,
+        n_colors,
+        img_size,
+        img_size,
+    ), f"Expected reconstructed shape {(batch_size, n_colors, img_size, img_size)}, got {reconstructed.shape}"
+    assert mu.shape == (
+        batch_size,
+        latent_dim,
+    ), f"Expected mu shape {(batch_size, latent_dim)}, got {mu.shape}"
+    assert log_var.shape == (
+        batch_size,
+        latent_dim,
+    ), f"Expected log_var shape {(batch_size, latent_dim)}, got {log_var.shape}"

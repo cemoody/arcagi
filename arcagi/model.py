@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Any
@@ -482,14 +483,14 @@ class CVAE(nn.Module):
         # This handles any size mismatches from the transposed convolutions
         if x.shape[2] != self.img_size or x.shape[3] != self.img_size:
             # Use resize to ensure exact output size
-            x = F.interpolate(
+            x = F.interpolate(  # type: ignore
                 x,
                 size=(self.img_size, self.img_size),
                 mode="bilinear",
                 align_corners=False,
             )
 
-        return x
+        return x  # type: ignore
 
     def encode(
         self, x: torch.Tensor, c: torch.Tensor
@@ -506,9 +507,6 @@ class CVAE(nn.Module):
             log_var: Log variance of the latent distribution
         """
         logger.debug(f"Encode input shape: {x.shape}, condition shape: {c.shape}")
-
-        # Get actual input dimensions
-        _, _, height, width = x.shape
 
         # Encode image
         if self.is_hypernetwork:
