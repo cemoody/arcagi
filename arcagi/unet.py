@@ -361,3 +361,5 @@ class ResidualRepeatedFixedWeightsUNet(nn.Module):
         for _ in range(self.num_layers):
             x = self.repeated_module(x) + x
         return x
+
+

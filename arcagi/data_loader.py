@@ -159,7 +159,7 @@ def repeat_and_permute(
 
     Args:
         inputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
-        outputs: A tensor with the same shape as inputs.
+        outputs: A tensor with the shape (B * n, 30, 30, 11) containing permuted inputs
         n: Number of times to repeat each sample.
 
     Returns:

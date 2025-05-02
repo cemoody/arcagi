@@ -1,5 +1,5 @@
 import torch
-
+from arcagi.data_loader import repeat_and_permute
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -121,3 +121,100 @@ def test_batch_generate_color_mapping_independent_per_sample() -> None:
         tuple(m[k] for k in sorted(m)) for m in mappings
     }
     assert len(unique_mappings) > 1, "Expected independent permutations across samples"
+
+
+def test_repeat_and_permute():
+    """Test that repeat_and_permute correctly repeats and permutes the input and output tensors."""
+    # Create a small test dataset
+    batch_size: int = 3
+    height: int = 30
+    width: int = 30
+    channels: int = 11
+    n_repeats: int = 4
+
+    # Create random one-hot encoded inputs and outputs
+    rand_vals: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
+    inputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
+    outputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
+
+    # Fill in one-hot encoded values
+    for b in range(batch_size):
+        for h in range(height):
+            for w in range(width):
+                color: int = int(rand_vals[b, h, w].item())
+                inputs[b, h, w, color] = 1.0
+                outputs[b, h, w, color] = 1.0
+
+    # Apply repeat_and_permute
+    repeated_inputs, repeated_outputs = repeat_and_permute(inputs, outputs, n_repeats)
+
+    # Check shapes
+    assert repeated_inputs.shape == (batch_size * n_repeats, height, width, channels)
+    assert repeated_outputs.shape == (batch_size * n_repeats, height, width, channels)
+
+    # Convert to categorical for easier verification
+    repeated_inputs_cat: torch.Tensor = _categorical_from_one_hot(repeated_inputs)
+    repeated_outputs_cat: torch.Tensor = _categorical_from_one_hot(repeated_outputs)
+
+    # Verify that each original sample is repeated n_repeats times with different permutations
+    for orig_idx in range(batch_size):
+        # Get the indices in the repeated tensor for this original sample
+        repeat_indices: list[int] = [
+            orig_idx + i * batch_size for i in range(n_repeats)
+        ]
+
+        # For each repeated instance, verify it's a valid permutation of the original
+        permutation_mappings: list[dict[int, int]] = []
+
+        for repeat_idx in repeat_indices:
+            # Build the color mapping for this repeated instance
+            mapping: dict[int, int] = {}
+
+            # Sample a few points to build the mapping
+            for h in range(0, height, 5):  # Sample every 5th point to save time
+                for w in range(0, width, 5):
+                    orig_color: int = int(rand_vals[orig_idx, h, w].item())
+                    if orig_color == -1:
+                        continue
+                    new_color: int = int(repeated_inputs_cat[repeat_idx, h, w].item())
+
+                    if orig_color in mapping:
+                        assert (
+                            mapping[orig_color] == new_color
+                        ), "Inconsistent mapping within a sample"
+                    else:
+                        mapping[orig_color] = new_color
+
+            # Verify it's a valid permutation
+            if len(mapping) == 11:  # Only check if we found all colors
+                assert set(mapping.keys()) == set(range(11))
+                assert set(mapping.values()) == set(range(11))
+
+            # Verify inputs and outputs have the same mapping
+            for h in range(0, height, 5):
+                for w in range(0, width, 5):
+                    orig_color: int = int(rand_vals[orig_idx, h, w].item())
+                    if orig_color == -1 or orig_color not in mapping:
+                        continue
+                    expected_color: int = mapping[orig_color]
+                    actual_color_input: int = int(
+                        repeated_inputs_cat[repeat_idx, h, w].item()
+                    )
+                    actual_color_output: int = int(
+                        repeated_outputs_cat[repeat_idx, h, w].item()
+                    )
+
+                    assert expected_color == actual_color_input
+                    assert expected_color == actual_color_output
+
+            permutation_mappings.append(mapping)
+
+        # Check that the permutations are different for each repeat
+        if all(len(m) == 11 for m in permutation_mappings):
+            unique_mappings: set[tuple[int, ...]] = {
+                tuple(m[k] for k in sorted(m)) for m in permutation_mappings
+            }
+            # With random permutations, it's highly unlikely all would be the same
+            assert (
+                len(unique_mappings) > 1
+            ), "Expected different permutations for repeated samples"
