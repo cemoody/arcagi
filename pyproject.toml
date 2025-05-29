@@ -14,5 +14,11 @@ dependencies = [
     "matplotlib>=3.8.0",
     "pydantic>=2.10.0",
     "rich>=14.0.0",
-    
+    "requests>=2.32.3",
+    "pytest>=8.3.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
 ]
