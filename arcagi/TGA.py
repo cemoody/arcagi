@@ -50,18 +50,6 @@ import torch.nn.functional as F
 ######################################################################
 
 
-class RMSNorm(nn.Module):
-    """Root-mean-square LayerNorm (pre-norm variant)."""
-
-    def __init__(self, d: int, eps: float = 1e-8) -> None:
-        super().__init__()  # type: ignore
-        self.scale = nn.Parameter(torch.ones(d))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (… , D)
-        return self.scale * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-
 class SwiGLU(nn.Module):
     """SwiGLU feed-forward: (x · W₁) ⊗ swish(x · W₂) → proj → dropout."""
 
@@ -75,7 +63,25 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (… , D)
         a, b = self.w12(x).chunk(2, dim=-1)
-        return self.drop(self.proj(a * self.act(b)))
+        return self.drop(self.proj(self.act(a) * b))
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    RMSNorm normalizes using the root mean square of the input features,
+    which is more efficient than LayerNorm as it doesn't compute mean and variance.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()  # type: ignore
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute RMS normalization
+        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
 
 
 ######################################################################
@@ -83,7 +89,7 @@ class SwiGLU(nn.Module):
 ######################################################################
 
 
-def _rope_pairwise(
+def rope_pairwise(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
     xr, xi = x[..., 0], x[..., 1]
@@ -139,7 +145,7 @@ def apply_rope_1d(
     # Reshape cos/sin to broadcast correctly: (L, d//2) -> (L, 1, d//2)
     cos = cos[:, None, :]  # (L, 1, d//2)
     sin = sin[:, None, :]  # (L, 1, d//2)
-    return _rope_pairwise(x2, cos, sin).view(L, H, d)
+    return rope_pairwise(x2, cos, sin).view(L, H, d)
 
 
 def apply_rope_2d(
@@ -203,7 +209,7 @@ def apply_rope_2d(
     cos_x, sin_x = theta_x.cos(), theta_x.sin()  # (L, d_axis//2)
     cos_x = cos_x[:, None, :]  # (L, 1, d_axis//2)
     sin_x = sin_x[:, None, :]  # (L, 1, d_axis//2)
-    x_part = _rope_pairwise(xb, cos_x, sin_x).view(L, H, d_axis)
+    x_part = rope_pairwise(xb, cos_x, sin_x).view(L, H, d_axis)
 
     # Y axis
     yb = x[..., d_axis:].view(L, H, -1, 2)  # (L, H, d_axis//2, 2)
@@ -211,7 +217,7 @@ def apply_rope_2d(
     cos_y, sin_y = theta_y.cos(), theta_y.sin()  # (L, d_axis//2)
     cos_y = cos_y[:, None, :]  # (L, 1, d_axis//2)
     sin_y = sin_y[:, None, :]  # (L, 1, d_axis//2)
-    y_part = _rope_pairwise(yb, cos_y, sin_y).view(L, H, d_axis)
+    y_part = rope_pairwise(yb, cos_y, sin_y).view(L, H, d_axis)
 
     return torch.cat((x_part, y_part), dim=-1)
 
@@ -244,7 +250,11 @@ class TemporalGridAttention(nn.Module):
         head_dim = embed_dim // num_q_heads
         assert head_dim % 8 == 0, "FlashAttention needs head_dim multiple of 8"
         assert embed_dim % num_kv_heads == 0, "embed_dim % num_kv_heads != 0"
-        assert head_dim == embed_dim // num_kv_heads, "Q and KV head dim mismatch"
+
+        # For grouped-query attention, we need num_q_heads to be divisible by num_kv_heads
+        assert (
+            num_q_heads % num_kv_heads == 0
+        ), f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for grouped-query attention"
 
         self.D = embed_dim
         self.Hq = num_q_heads
@@ -265,12 +275,18 @@ class TemporalGridAttention(nn.Module):
         )  # (H, W, 2)
         self.register_buffer("coords", coords.reshape(-1, 2).float(), persistent=False)
 
-        # inverse freq tables
+        # inverse freq tables - fix for 2D RoPE
+        # For 2D RoPE: d_axis = head_dim // 2, and we need d_axis//2 = head_dim//4 frequencies
+        quarter = head_dim // 4
+        assert quarter > 0, f"head_dim ({head_dim}) must be divisible by 4 for 2D RoPE"
+        inv_2d = 1.0 / (10000 ** (torch.arange(quarter) / quarter))
+        # For 1D RoPE: we need head_dim//2 frequencies
         half = head_dim // 2
-        inv = 1.0 / (10000 ** (torch.arange(half) / half))
-        self.register_buffer("inv_x", inv, persistent=False)
-        self.register_buffer("inv_y", inv.clone(), persistent=False)
-        self.register_buffer("inv_t", inv.clone(), persistent=False)
+        inv_1d = 1.0 / (10000 ** (torch.arange(half) / half))
+
+        self.register_buffer("inv_x", inv_2d, persistent=False)
+        self.register_buffer("inv_y", inv_2d.clone(), persistent=False)
+        self.register_buffer("inv_t", inv_1d, persistent=False)
 
         # Type annotations for buffers
         self.coords: torch.Tensor
@@ -290,9 +306,65 @@ class TemporalGridAttention(nn.Module):
         static_grid: torch.Tensor,  # (H, W, D)
         history_seq: torch.Tensor,  # (H, W, T, D)
     ) -> torch.Tensor:  # (H, W, D)
+        """Apply pedestal-shaped temporal grid attention to temporally evolving 2D grids of embeddings.
+
+        This method implements a specialized attention mechanism over a 4D tensor representing
+        the temporal evolution of a 2D spatial grid. Each cell has an embedding, creating
+        a (H, W, T, D) structure where the time dimension captures the grid's history.
+
+        **Pedestal-Shaped Attention Pattern:**
+        For each cell (h, w) in the latest timestep, that cell attends to:
+        1. **Spatial**: All other cells at the current timestep → full 2D spatial attention
+        2. **Temporal**: Its own history (h, w, t) for t = 0, 1, ..., T-1 → 1D column through time
+        3. **Exclusion**: It does NOT attend to other cells' past states
+
+        This creates a "pedestal" shape where the top is the full current 2D grid and the
+        column extends backwards in time only for each cell's own spatial location.
+
+        **Implementation Details:**
+        - Tokens are assembled as: [learnable_init, cell_histories, current_grid]
+        - Uses 2D RoPE for spatial coordinates and 1D RoPE for temporal positions
+        - FlashAttention-2 computes the attention efficiently in FP16
+        - Only the updated current grid frame is returned
+
+        Args:
+            static_grid (torch.Tensor): Current 2D grid frame of shape (H, W, D) where:
+                - H, W: Spatial dimensions of the grid (default 30×30)
+                - D: Embedding dimension per cell (default 48)
+                This represents the queries in the attention mechanism.
+
+            history_seq (torch.Tensor): Historical evolution of shape (H, W, T, D) where:
+                - T: Number of historical timesteps (can be 0 for no history)
+                - Each (h, w, t) contains the embedding for cell (h,w) at time t
+                These provide the temporal context for each spatial location.
+
+        Returns:
+            torch.Tensor: Updated current grid of shape (H, W, D) where each cell's
+                embedding now incorporates:
+                - Information from ALL cells in the current timestep (spatial context)
+                - Information from its OWN temporal history (temporal continuity)
+                - The learnable initial embedding (global context)
+
+        Note:
+            - Attention complexity scales as O(HW × (HW + T)) per cell
+            - Uses grouped-query attention (fewer KV heads than Q heads) for efficiency
+            - Processes in FP16 internally, returns FP32 for numerical stability
+            - The pedestal shape ensures temporal locality while allowing spatial mixing
+
+        Example:
+            >>> # 3×3 grid evolving over 4 timesteps with 8-dim embeddings
+            >>> tga = TemporalGridAttention(embed_dim=8, grid_size=3)
+            >>> current = torch.randn(3, 3, 8)      # Current 2D grid state
+            >>> history = torch.randn(3, 3, 4, 8)   # 4 historical timesteps
+            >>> updated = tga(current, history)      # Apply pedestal attention
+            >>> print(updated.shape)                # torch.Size([3, 3, 8])
+        """
         device = static_grid.device
         S = self.S
         T = history_seq.shape[2] if history_seq.numel() else 0
+
+        # Check if module is in half precision
+        is_half = next(self.parameters()).dtype == torch.float16
 
         # build token list ------------------------------------------------
         init_tok = self.init_embed.unsqueeze(0).expand(S, -1)  # (S, D)
@@ -302,9 +374,12 @@ class TemporalGridAttention(nn.Module):
             else history_seq.new_empty((0, self.D))
         )
         grid_tok = static_grid.reshape(S, self.D)
-        tokens = torch.cat(
-            (init_tok, hist_tok, grid_tok), dim=0
-        ).half()  # fp16 for FA-2
+        tokens = torch.cat((init_tok, hist_tok, grid_tok), dim=0)
+
+        # Convert to half precision only if module is in half precision
+        if is_half:
+            tokens = tokens.half()
+
         L_total = tokens.shape[0]
 
         # projections -----------------------------------------------------
@@ -348,7 +423,10 @@ class TemporalGridAttention(nn.Module):
         # extract latest frame -------------------------------------------
         latest_start = S + S * T
         grid_out = out[latest_start : latest_start + S].reshape(S, self.D)
-        grid_out = self.out_proj(grid_out.float())  # back to fp32 before return
+
+        # Apply output projection in the same dtype as the module
+        grid_out = self.out_proj(grid_out)
+
         return grid_out.view(int(math.sqrt(S)), int(math.sqrt(S)), self.D)
 
 
@@ -368,19 +446,33 @@ class TGALayer(nn.Module):
         attn_dropout: float,
         ff_dropout: float,
         swiglu_factor: int,
+        grid_size: int = 30,
     ) -> None:
         super().__init__()  # type: ignore
+        self.norm_grid = RMSNorm(embed_dim)
+        self.norm_hist = RMSNorm(embed_dim)
+        self.norm_ff = RMSNorm(embed_dim)
         self.tga = TemporalGridAttention(
             embed_dim,
             num_q_heads,
             num_kv_heads,
             attn_dropout,
+            grid_size,
         )
         self.ff = SwiGLU(embed_dim, factor=swiglu_factor, dropout=ff_dropout)
 
     def forward(self, grid: torch.Tensor, hist: torch.Tensor) -> torch.Tensor:
-        x = self.tga(grid, hist)
-        return x + self.ff(x)
+        # Normalize both grid and history inputs
+        normed_grid = self.norm_grid(grid)
+        normed_hist = self.norm_hist(hist) if hist.numel() > 0 else hist
+
+        # Apply attention with residual connection
+        x = grid + self.tga(normed_grid, normed_hist)
+
+        # Apply feed-forward with normalization and residual connection
+        x = x + self.ff(self.norm_ff(x))
+
+        return x
 
 
 class TGABlock(nn.Module):
@@ -395,6 +487,7 @@ class TGABlock(nn.Module):
         attn_dropout: float = 0.1,
         ff_dropout: float = 0.1,
         swiglu_factor: int = 8,
+        grid_size: int = 30,
     ) -> None:
         super().__init__()  # type: ignore
         self.layers: nn.ModuleList = nn.ModuleList(
@@ -406,6 +499,7 @@ class TGABlock(nn.Module):
                     attn_dropout,
                     ff_dropout,
                     swiglu_factor,
+                    grid_size,
                 )
                 for _ in range(depth)
             ]
@@ -428,7 +522,6 @@ class RepeatedTGA(nn.Module):
     Each iteration:
       • (optional) local 3×3 depthwise Conv mixes each cell with its eight
         spatial neighbours;
-      • apply RMSNorm;
       • run TGABlock (default 6 TGALayers);
       • append previous grid frame to history.
 

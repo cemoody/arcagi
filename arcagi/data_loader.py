@@ -1,6 +1,8 @@
+from typing import Any, List, Optional, Tuple
+
 import pandas as pd
 import torch
-from typing import Tuple, List
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def load_parquet_data(
@@ -175,6 +177,135 @@ def repeat_and_permute(
     )
 
     return permuted_inputs, permuted_outputs
+
+
+# ---------------------------------------------------------------------------
+# DataLoader creation utilities
+# ---------------------------------------------------------------------------
+
+
+def filter_by_filename(
+    filenames: List[str],
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+    target_filename: str,
+    dataset_name: str = "data",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Filter tensors to only include examples from a specific filename.
+
+    Args:
+        filenames: List of filenames for each example
+        inputs: Input tensor to filter
+        outputs: Output tensor to filter
+        target_filename: Filename to filter by
+        dataset_name: Name of dataset for logging (e.g., "training", "validation")
+
+    Returns:
+        Filtered inputs and outputs tensors
+
+    Raises:
+        ValueError: If no examples found with the target filename (only for non-validation sets)
+    """
+    print(f"Filtering {dataset_name} to filename: {target_filename}")
+
+    # Find indices where filename matches
+    mask = [fname == target_filename for fname in filenames]
+    filtered_indices = [i for i, m in enumerate(mask) if m]
+
+    if not filtered_indices:
+        if dataset_name.lower() == "validation":
+            print(
+                f"Warning: No {dataset_name} examples found with filename: {target_filename}"
+            )
+            return torch.empty(0, 30, 30, 11), torch.empty(0, 30, 30, 11)
+        else:
+            raise ValueError(
+                f"No {dataset_name} examples found with filename: {target_filename}"
+            )
+
+    # Filter the tensors
+    filtered_inputs = inputs[filtered_indices]
+    filtered_outputs = outputs[filtered_indices]
+    print(
+        f"Found {len(filtered_indices)} {dataset_name} examples with filename {target_filename}"
+    )
+
+    return filtered_inputs, filtered_outputs
+
+
+def prepare_dataset(
+    parquet_path: str,
+    filter_filename: Optional[str] = None,
+    limit_examples: Optional[int] = None,
+    augment_factor: int = 1,
+    dataset_name: str = "data",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load and prepare a dataset from a parquet file with optional filtering and augmentation.
+
+    Args:
+        parquet_path: Path to the parquet file
+        filter_filename: Optional filename to filter examples
+        limit_examples: Optional limit on number of examples
+        augment_factor: Factor for data augmentation via color permutation
+        dataset_name: Name of dataset for logging
+
+    Returns:
+        Prepared inputs and outputs tensors
+    """
+    print(f"Loading {dataset_name} from {parquet_path}...")
+    filenames, _, inputs, outputs = load_parquet_data(parquet_path)
+
+    # Apply filtering if requested
+    if filter_filename is not None:
+        inputs, outputs = filter_by_filename(
+            filenames, inputs, outputs, filter_filename, dataset_name
+        )
+
+    # Apply limit if requested
+    if limit_examples is not None:
+        inputs = inputs[:limit_examples]
+        outputs = outputs[:limit_examples]
+        print(f"Limited to {limit_examples} {dataset_name} examples")
+
+    # Apply augmentation if requested
+    if augment_factor > 1:
+        print(f"Applying {augment_factor}x augmentation to {dataset_name}...")
+        inputs, outputs = repeat_and_permute(inputs, outputs, augment_factor)
+
+    print(
+        f"{dataset_name.capitalize()} shape: inputs={inputs.shape}, outputs={outputs.shape}"
+    )
+
+    return inputs, outputs
+
+
+def create_dataloader(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 4,
+) -> DataLoader[Any]:
+    """Create a DataLoader from input and output tensors.
+
+    Args:
+        inputs: Input tensor
+        outputs: Output tensor
+        batch_size: Batch size for the DataLoader
+        shuffle: Whether to shuffle the data
+        num_workers: Number of worker processes
+
+    Returns:
+        DataLoader instance
+    """
+    dataset = TensorDataset(inputs, outputs)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 if __name__ == "__main__":
