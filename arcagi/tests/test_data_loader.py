@@ -1,4 +1,5 @@
 import torch
+
 from arcagi.data_loader import repeat_and_permute
 
 # ---------------------------------------------------------------------------
@@ -218,3 +219,90 @@ def test_repeat_and_permute():
             assert (
                 len(unique_mappings) > 1
             ), "Expected different permutations for repeated samples"
+
+
+def test_apply_mixing_steps():
+    """Test that apply_mixing_steps correctly creates intermediate states."""
+    from arcagi.data_loader import apply_mixing_steps
+
+    # Create a simple test case with known values
+    batch_size: int = 4
+    height: int = 30
+    width: int = 30
+    channels: int = 11
+    n_steps: int = 4
+
+    # Create simple inputs and outputs where we can verify the mixing
+    # Input: all pixels are color 0 (one-hot)
+    # Output: all pixels are color 1 (one-hot)
+    inputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
+    outputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
+
+    inputs[:, :, :, 0] = 1.0  # All pixels are color 0
+    outputs[:, :, :, 1] = 1.0  # All pixels are color 1
+
+    # Apply mixing steps
+    mixed_inputs, mixed_outputs = apply_mixing_steps(inputs, outputs, n_steps)
+
+    # Check shapes are preserved
+    assert mixed_inputs.shape == inputs.shape
+    assert mixed_outputs.shape == outputs.shape
+
+    # For each sample, verify the mixing is correct
+    for b in range(batch_size):
+        # Get the value at channel 0 and 1 for a sample pixel
+        input_ch0: float = mixed_inputs[b, 0, 0, 0].item()
+        input_ch1: float = mixed_inputs[b, 0, 0, 1].item()
+        output_ch0: float = mixed_outputs[b, 0, 0, 0].item()
+        output_ch1: float = mixed_outputs[b, 0, 0, 1].item()
+
+        # The fraction f should be one of {0, 0.25, 0.5, 0.75}
+        # For mixed_input: ch0 = f, ch1 = (1-f)
+        # For mixed_output: ch0 = (f - 0.25), ch1 = (1 - f + 0.25)
+
+        # Determine which f was used based on input_ch0
+        f: float = input_ch0
+
+        # Verify f is one of the expected values
+        assert f in [0.0, 0.25, 0.5, 0.75] or abs(f - round(f * 4) / 4) < 1e-6
+
+        # Verify the mixing formulas
+        assert abs(input_ch1 - (1 - f)) < 1e-6
+
+        # For output, when f = 0, we expect ch0 = -0.25, ch1 = 1.25
+        # But it should be clamped to [0, 1]
+        expected_output_ch0: float = max(0.0, f - 0.25)
+        expected_output_ch1: float = min(1.0, 1 - f + 0.25)
+
+        assert abs(output_ch0 - expected_output_ch0) < 1e-6
+        assert abs(output_ch1 - expected_output_ch1) < 1e-6
+
+        # Verify all channels sum to 1 (valid probability distribution)
+        input_sum: float = mixed_inputs[b, 0, 0, :].sum().item()
+        output_sum: float = mixed_outputs[b, 0, 0, :].sum().item()
+        assert abs(input_sum - 1.0) < 1e-6
+        assert abs(output_sum - 1.0) < 1e-6
+
+    # Test with more complex case - different colors
+    torch.manual_seed(42)  # type: ignore[arg-type]
+    rand_input_colors: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
+    rand_output_colors: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
+
+    complex_inputs: torch.Tensor = _one_hot_from_int(rand_input_colors)
+    complex_outputs: torch.Tensor = _one_hot_from_int(rand_output_colors)
+
+    mixed_inputs, mixed_outputs = apply_mixing_steps(
+        complex_inputs, complex_outputs, n_steps
+    )
+
+    # Verify probability distributions are valid
+    assert torch.all(mixed_inputs >= 0)
+    assert torch.all(mixed_inputs <= 1)
+    assert torch.all(mixed_outputs >= 0)
+    assert torch.all(mixed_outputs <= 1)
+
+    # Verify sums are approximately 1
+    input_sums: torch.Tensor = mixed_inputs.sum(dim=-1)
+    output_sums: torch.Tensor = mixed_outputs.sum(dim=-1)
+    assert torch.allclose(input_sums, torch.ones_like(input_sums), atol=1e-6)
+    assert torch.allclose(output_sums, torch.ones_like(output_sums), atol=1e-6)

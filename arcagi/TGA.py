@@ -53,7 +53,7 @@ import torch.nn.functional as F
 class SwiGLU(nn.Module):
     """SwiGLU feed-forward: (x · W₁) ⊗ swish(x · W₂) → proj → dropout."""
 
-    def __init__(self, d_model: int, factor: int = 8, dropout: float = 0.1) -> None:
+    def __init__(self, d_model: int, factor: int = 8, dropout: float = 0.01) -> None:
         super().__init__()  # type: ignore
         hidden = factor * d_model
         self.w12 = nn.Linear(d_model, hidden * 2, bias=False)
@@ -242,7 +242,7 @@ class TemporalGridAttention(nn.Module):
         embed_dim: int = 48,
         num_q_heads: int = 6,
         num_kv_heads: int = 2,
-        attn_dropout: float = 0.1,
+        attn_dropout: float = 0.01,
         grid_size: int = 30,
     ) -> None:
         super().__init__()  # type: ignore
@@ -480,12 +480,12 @@ class TGABlock(nn.Module):
 
     def __init__(
         self,
-        depth: int = 6,
+        depth: int = 1,
         embed_dim: int = 48,
         num_q_heads: int = 6,
         num_kv_heads: int = 2,
-        attn_dropout: float = 0.1,
-        ff_dropout: float = 0.1,
+        attn_dropout: float = 0.01,
+        ff_dropout: float = 0.01,
         swiglu_factor: int = 8,
         grid_size: int = 30,
     ) -> None:
@@ -534,8 +534,8 @@ class RepeatedTGA(nn.Module):
         embed_dim: int = 48,
         num_q_heads: int = 6,
         num_kv_heads: int = 2,
-        attn_dropout: float = 0.1,
-        ff_dropout: float = 0.1,
+        attn_dropout: float = 0.01,
+        ff_dropout: float = 0.01,
         swiglu_factor: int = 8,
     ) -> None:
         super().__init__()  # type: ignore
@@ -550,11 +550,12 @@ class RepeatedTGA(nn.Module):
 
     def forward(
         self,
-        grid: torch.Tensor,
+        input: torch.Tensor,
         history: torch.Tensor,
         max_timesteps: int,
         local_mix: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        grid = input
         for _ in range(max_timesteps):
             if local_mix:
                 grid = self.local_mix(grid)

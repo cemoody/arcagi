@@ -40,9 +40,11 @@ def load_parquet_data(
     outputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float)
 
     # Fill in one-hot encoded values
-    for color in range(11):
+    for color in range(10):
         inputs[:, :, :, color] = (inputs_raw == color).float()
         outputs[:, :, :, color] = (outputs_raw == color).float()
+    inputs[:, :, :, 10] = (inputs_raw == -1).float()
+    outputs[:, :, :, 10] = (outputs_raw == -1).float()
 
     return filenames, indices, inputs, outputs
 
@@ -76,11 +78,13 @@ def generate_color_mapping(
     return new_inputs, new_outputs
 
 
-def one_hot_to_categorical(one_hot_tensor: torch.Tensor) -> torch.Tensor:
+def one_hot_to_categorical(
+    one_hot_tensor: torch.Tensor, last_value: int = 10
+) -> torch.Tensor:
     # Get the indices of the maximum values along the last dimension
     cat: torch.Tensor = torch.argmax(one_hot_tensor, dim=-1)
     sum: torch.Tensor = one_hot_tensor.sum(dim=-1)
-    cat[sum == 0] = -1
+    cat[sum <= 1e-6] = last_value
     return cat
 
 
@@ -179,6 +183,49 @@ def repeat_and_permute(
     return permuted_inputs, permuted_outputs
 
 
+def apply_mixing_steps(
+    inputs: torch.Tensor, outputs: torch.Tensor, n_steps: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply mixing steps to create intermediate states between inputs and outputs.
+
+    For each sample, randomly picks a fraction f from {0, 1/n, 2/n, ..., (n-1)/n}.
+    Creates new_input = input * f + output * (1 - f)
+    Creates new_output = input * (f - 1/n) + output * (1 - f + 1/n)
+
+    Args:
+        inputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
+        outputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
+        n_steps: Number of mixing steps (n).
+
+    Returns:
+        Tuple containing the mixed inputs and outputs with the same shape.
+    """
+    batch_size = inputs.shape[0]
+
+    # Generate random fractions for each sample
+    # f can be 0, 1/n, 2/n, ..., (n-1)/n
+    step_indices = torch.randint(0, n_steps, (batch_size,), device=inputs.device)
+    f = step_indices.float() / n_steps  # Shape: (B,)
+
+    # Reshape f for broadcasting
+    f = f.view(batch_size, 1, 1, 1)  # Shape: (B, 1, 1, 1)
+
+    # Calculate new inputs: input * f + output * (1 - f)
+    new_inputs = inputs * f + outputs * (1 - f)
+
+    # Calculate new outputs: input * (f - 1/n) + output * (1 - f + 1/n)
+    # Note: When f = 0, this becomes input * (-1/n) + output * (1 + 1/n)
+    # We need to clamp to ensure valid probabilities
+    f_minus = f - 1.0 / n_steps
+    new_outputs = inputs * f_minus + outputs * (1 - f_minus)
+
+    # Ensure outputs remain valid probability distributions
+    # (though the math should preserve this if inputs and outputs are valid)
+    new_outputs = torch.clamp(new_outputs, min=0.0, max=1.0)
+
+    return new_inputs, new_outputs
+
+
 # ---------------------------------------------------------------------------
 # DataLoader creation utilities
 # ---------------------------------------------------------------------------
@@ -238,6 +285,7 @@ def prepare_dataset(
     filter_filename: Optional[str] = None,
     limit_examples: Optional[int] = None,
     augment_factor: int = 1,
+    use_mixing_steps: Optional[int] = None,
     dataset_name: str = "data",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Load and prepare a dataset from a parquet file with optional filtering and augmentation.
@@ -247,6 +295,7 @@ def prepare_dataset(
         filter_filename: Optional filename to filter examples
         limit_examples: Optional limit on number of examples
         augment_factor: Factor for data augmentation via color permutation
+        use_mixing_steps: Optional number of mixing steps for creating intermediate states
         dataset_name: Name of dataset for logging
 
     Returns:
@@ -271,6 +320,11 @@ def prepare_dataset(
     if augment_factor > 1:
         print(f"Applying {augment_factor}x augmentation to {dataset_name}...")
         inputs, outputs = repeat_and_permute(inputs, outputs, augment_factor)
+
+    # Apply mixing steps if requested
+    if use_mixing_steps is not None:
+        print(f"Applying mixing steps with n={use_mixing_steps} to {dataset_name}...")
+        inputs, outputs = apply_mixing_steps(inputs, outputs, use_mixing_steps)
 
     print(
         f"{dataset_name.capitalize()} shape: inputs={inputs.shape}, outputs={outputs.shape}"

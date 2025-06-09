@@ -182,6 +182,7 @@ def create_dataloaders(
     limit_examples: Optional[int] = None,
     augment_factor: int = 1,
     filter_filename: Optional[str] = None,
+    use_mixing_steps: Optional[int] = None,
 ) -> Tuple[DataLoader[Any], Optional[DataLoader[Any]]]:
     """Create train and validation dataloaders from parquet files."""
 
@@ -191,6 +192,7 @@ def create_dataloaders(
         filter_filename=filter_filename,
         limit_examples=limit_examples,
         augment_factor=augment_factor,
+        use_mixing_steps=use_mixing_steps,
         dataset_name="training data",
     )
 
@@ -211,6 +213,7 @@ def create_dataloaders(
             filter_filename=filter_filename,
             limit_examples=limit_examples,
             augment_factor=1,  # No augmentation for validation
+            use_mixing_steps=None,  # No mixing steps for validation
             dataset_name="validation data",
         )
 
@@ -258,6 +261,12 @@ def main():
         type=str,
         default=None,
         help="Filter examples to only include those from this filename (e.g., 025d127b.json)",
+    )
+    parser.add_argument(
+        "--use_mixing_steps",
+        type=int,
+        default=None,
+        help="Number of mixing steps for creating intermediate states between input and output",
     )
 
     # Model arguments
@@ -318,6 +327,7 @@ def main():
         limit_examples=args.limit_examples,
         augment_factor=args.augment_factor,
         filter_filename=args.filter_filename,
+        use_mixing_steps=args.use_mixing_steps,
     )
 
     # Create model
@@ -354,6 +364,7 @@ def main():
                 "augment_factor": args.augment_factor,
                 "filter_filename": args.filter_filename,
                 "limit_examples": args.limit_examples,
+                "use_mixing_steps": args.use_mixing_steps,
             },
         )
         logger = WandbLogger(
