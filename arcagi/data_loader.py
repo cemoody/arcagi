@@ -1,234 +1,95 @@
 from typing import Any, List, Optional, Tuple
 
-import pandas as pd
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch.utils.data import DataLoader, TensorDataset
 
 
-def load_parquet_data(
-    parquet_path: str,
-) -> Tuple[List[str], List[int], torch.Tensor, torch.Tensor]:
+def load_npz_data(
+    npz_path: str,
+    use_features: bool = False,
+) -> Tuple[
+    List[str],
+    List[int],
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """
-    Loads data from a parquet file created by preprocess.py and creates PyTorch arrays.
-    """
-    # Load the parquet file
-    df: pd.DataFrame = pd.read_parquet(parquet_path)
+    Loads data from an NPZ file created by preprocess_v2.py and creates PyTorch tensors.
 
-    # Extract filenames and indices
-    filenames: List[str] = df["filename"].tolist()
-    indices: List[int] = df["index"].tolist()
+    Args:
+        npz_path: Path to the NPZ file
+        use_features: Whether to load concatenated features (if available)
+
+    Returns:
+        filenames: List of filename strings
+        indices: List of example indices within each file
+        inputs: torch.Tensor of shape (n_examples, 30, 30, 11) with one-hot encoded colors
+        outputs: torch.Tensor of shape (n_examples, 30, 30, 11) with one-hot encoded colors
+        inputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
+        outputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
+    """
+    # Load the NPZ file
+    data = np.load(npz_path)
+
+    # Extract basic data
+    filenames: List[str] = data["filenames"].tolist()
+    indices: List[int] = data["indices"].tolist()
+    inputs_raw: NDArray[np.int32] = data["inputs"]  # Shape: (n_examples, 30, 30)
+    outputs_raw: NDArray[np.int32] = data["outputs"]  # Shape: (n_examples, 30, 30)
 
     # Get number of examples
-    num_examples: int = len(df)
+    num_examples: int = len(filenames)
 
-    # Initialize raw tensors
-    inputs_raw: torch.Tensor = torch.full((num_examples, 30, 30), -1, dtype=torch.int)
-    outputs_raw: torch.Tensor = torch.full((num_examples, 30, 30), -1, dtype=torch.int)
+    # Convert raw color data to one-hot encoded tensors
+    inputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float32)
+    outputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float32)
 
-    # Fill tensors with values from DataFrame
-    for i in range(30):
-        for j in range(30):
-            inputs_raw[:, i, j] = torch.tensor(
-                df[f"input_{i}_{j}"].values, dtype=torch.int
-            )
-            outputs_raw[:, i, j] = torch.tensor(
-                df[f"output_{i}_{j}"].values, dtype=torch.int
-            )
+    # Convert to torch tensors first
+    inputs_raw_tensor = torch.from_numpy(inputs_raw).long()  # type: ignore
+    outputs_raw_tensor = torch.from_numpy(outputs_raw).long()  # type: ignore
 
-    # Create one-hot encoded tensors for colors 0-10
-    inputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float)
-    outputs: torch.Tensor = torch.zeros((num_examples, 30, 30, 11), dtype=torch.float)
-
-    # Fill in one-hot encoded values
+    # Fill in one-hot encoded values for colors 0-9
     for color in range(10):
-        inputs[:, :, :, color] = (inputs_raw == color).float()
-        outputs[:, :, :, color] = (outputs_raw == color).float()
-    inputs[:, :, :, 10] = (inputs_raw == -1).float()
-    outputs[:, :, :, 10] = (outputs_raw == -1).float()
+        inputs[:, :, :, color] = (inputs_raw_tensor == color).float()
+        outputs[:, :, :, color] = (outputs_raw_tensor == color).float()
 
-    return filenames, indices, inputs, outputs
+    # Color 10 represents mask (-1)
+    inputs[:, :, :, 10] = (inputs_raw_tensor == -1).float()
+    outputs[:, :, :, 10] = (outputs_raw_tensor == -1).float()
 
+    # Load features if requested and available
+    inputs_features: Optional[torch.Tensor] = None
+    outputs_features: Optional[torch.Tensor] = None
 
-def generate_color_mapping(
-    inputs: torch.Tensor,
-    outputs: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Generates a random one-to-one mapping for colors 0-10 (excluding -1) and applies it to the input tensors.
-    """
-    assert inputs.shape == outputs.shape
-    assert inputs.shape[0] == 30
-    assert inputs.shape[1] == 30
+    if use_features:
+        if "inputs_features" in data and "outputs_features" in data:
+            inputs_features_raw: NDArray[np.uint8] = data["inputs_features"]
+            outputs_features_raw: NDArray[np.uint8] = data["outputs_features"]
+            inputs_features = torch.from_numpy(inputs_features_raw)  # type: ignore
+            outputs_features = torch.from_numpy(outputs_features_raw)  # type: ignore
+            feature_names = data.get("feature_names", [])
+            print(
+                f"Loaded features: {inputs_features.shape}, features: {feature_names}"
+            )
+        else:
+            print("Warning: Features requested but not found in NPZ file")
 
-    # Turn inputs into a one-hot 3 dimensional array
-
-    # Generate a random permutation of colors 0 to 10
-    colors: torch.Tensor = torch.arange(11)
-    color_mapping: torch.Tensor = colors[torch.randperm(11)]
-
-    # Initialize new tensors
-    new_inputs: torch.Tensor = torch.zeros_like(inputs)
-    new_outputs: torch.Tensor = torch.zeros_like(outputs)
-
-    # Permute the color channels - efficient vectorized operation
-    for old_color in range(11):
-        new_color = int(color_mapping[old_color].item())
-        new_inputs[:, :, new_color] = inputs[:, :, old_color]
-        new_outputs[:, :, new_color] = outputs[:, :, old_color]
-    return new_inputs, new_outputs
+    return filenames, indices, inputs, outputs, inputs_features, outputs_features
 
 
 def one_hot_to_categorical(
     one_hot_tensor: torch.Tensor, last_value: int = 10
 ) -> torch.Tensor:
+    """Convert one-hot encoded tensor to categorical values."""
     # Get the indices of the maximum values along the last dimension
     cat: torch.Tensor = torch.argmax(one_hot_tensor, dim=-1)
-    sum: torch.Tensor = one_hot_tensor.sum(dim=-1)
-    cat[sum <= 1e-6] = last_value
+    sum_vals: torch.Tensor = one_hot_tensor.sum(dim=-1)
+    cat[sum_vals <= 1e-6] = last_value
     return cat
-
-
-# ---------------------------------------------------------------------------
-# Color permutation utilities
-# ---------------------------------------------------------------------------
-
-
-def batch_generate_color_mapping(
-    inputs: torch.Tensor, outputs: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply an independent random permutation of the 11 colour channels (0-10)
-    to *each* example in a batch.
-
-    The permutation for a given sample is shared between its ``inputs`` and
-    ``outputs`` so that the mapping is aligned.  All permutations are mutually
-    independent across the batch.
-
-    Args:
-        inputs:  A tensor of shape ``(B, H, W, 11)`` containing one-hot encoded
-            colours for *B* samples.
-        outputs: Tensor with the same shape as ``inputs``.
-
-    Returns:
-        Tuple containing the permuted ``inputs`` and ``outputs`` (same shape as
-        the originals).
-    """
-
-    # Basic validation – we expect one-hot encoded channels on the last axis.
-    assert (
-        inputs.shape == outputs.shape
-    ), "inputs and outputs must have identical shapes"
-    assert inputs.dim() == 4, "Expected inputs with shape (B, H, W, 11)"
-    batch_size: int
-    height: int
-    width: int
-    channels: int
-    batch_size, height, width, channels = inputs.shape
-    assert channels == 11, "Colour channel dimension (last dim) must be 11"
-
-    # ---------------------------------------------------------------------
-    # Generate a *vectorised* set of independent random permutations.
-    # ---------------------------------------------------------------------
-    # Draw random values and argsort – this produces a random permutation for
-    # every sample without an explicit Python loop, keeping the operation on
-    # the GPU when available.
-    perm: torch.Tensor = torch.argsort(
-        torch.rand(batch_size, channels, device=inputs.device), dim=1
-    )
-
-    # ---------------------------------------------------------------------
-    # Re-index the colour channel using ``torch.gather``.
-    # ---------------------------------------------------------------------
-    # Move channel axis to dim=1 for easier gathering.
-    inputs_bchw: torch.Tensor = inputs.permute(0, 3, 1, 2)  # (B, C, H, W)
-    outputs_bchw: torch.Tensor = outputs.permute(0, 3, 1, 2)
-
-    # Expand perm so it can index the (H, W) spatial dimensions.
-    perm_expanded: torch.Tensor = perm[:, :, None, None].expand(-1, -1, height, width)
-
-    # Gather along the channel dimension.
-    permuted_inputs_bchw: torch.Tensor = torch.gather(inputs_bchw, 1, perm_expanded)
-    permuted_outputs_bchw: torch.Tensor = torch.gather(outputs_bchw, 1, perm_expanded)
-
-    # Restore original layout (B, H, W, C).
-    permuted_inputs: torch.Tensor = permuted_inputs_bchw.permute(0, 2, 3, 1)
-    permuted_outputs: torch.Tensor = permuted_outputs_bchw.permute(0, 2, 3, 1)
-
-    return permuted_inputs, permuted_outputs
-
-
-def repeat_and_permute(
-    inputs: torch.Tensor, outputs: torch.Tensor, n: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Repeats the input and output tensors n times along the batch dimension and applies
-    independent color permutations to each sample.
-
-    Args:
-        inputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
-        outputs: A tensor with the shape (B * n, 30, 30, 11) containing permuted inputs
-        n: Number of times to repeat each sample.
-
-    Returns:
-        Tuple containing the repeated and permuted inputs and outputs with shape (B*n, 30, 30, 11).
-    """
-    # Repeat each sample n times
-    repeated_inputs: torch.Tensor = inputs.repeat(n, 1, 1, 1)
-    repeated_outputs: torch.Tensor = outputs.repeat(n, 1, 1, 1)
-
-    # Apply independent color permutations to each sample
-    permuted_inputs, permuted_outputs = batch_generate_color_mapping(
-        repeated_inputs, repeated_outputs
-    )
-
-    return permuted_inputs, permuted_outputs
-
-
-def apply_mixing_steps(
-    inputs: torch.Tensor, outputs: torch.Tensor, n_steps: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply mixing steps to create intermediate states between inputs and outputs.
-
-    For each sample, randomly picks a fraction f from {0, 1/n, 2/n, ..., (n-1)/n}.
-    Creates new_input = input * f + output * (1 - f)
-    Creates new_output = input * (f - 1/n) + output * (1 - f + 1/n)
-
-    Args:
-        inputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
-        outputs: A tensor of shape (B, 30, 30, 11) containing one-hot encoded colors.
-        n_steps: Number of mixing steps (n).
-
-    Returns:
-        Tuple containing the mixed inputs and outputs with the same shape.
-    """
-    batch_size = inputs.shape[0]
-
-    # Generate random fractions for each sample
-    # f can be 0, 1/n, 2/n, ..., (n-1)/n
-    step_indices = torch.randint(0, n_steps, (batch_size,), device=inputs.device)
-    f = step_indices.float() / n_steps  # Shape: (B,)
-
-    # Reshape f for broadcasting
-    f = f.view(batch_size, 1, 1, 1)  # Shape: (B, 1, 1, 1)
-
-    # Calculate new inputs: input * f + output * (1 - f)
-    new_inputs = inputs * f + outputs * (1 - f)
-
-    # Calculate new outputs: input * (f - 1/n) + output * (1 - f + 1/n)
-    # Note: When f = 0, this becomes input * (-1/n) + output * (1 + 1/n)
-    # We need to clamp to ensure valid probabilities
-    f_minus = f - 1.0 / n_steps
-    new_outputs = inputs * f_minus + outputs * (1 - f_minus)
-
-    # Ensure outputs remain valid probability distributions
-    # (though the math should preserve this if inputs and outputs are valid)
-    new_outputs = torch.clamp(new_outputs, min=0.0, max=1.0)
-
-    return new_inputs, new_outputs
-
-
-# ---------------------------------------------------------------------------
-# DataLoader creation utilities
-# ---------------------------------------------------------------------------
 
 
 def filter_by_filename(
@@ -237,7 +98,9 @@ def filter_by_filename(
     outputs: torch.Tensor,
     target_filename: str,
     dataset_name: str = "data",
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    inputs_features: Optional[torch.Tensor] = None,
+    outputs_features: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Filter tensors to only include examples from a specific filename.
 
     Args:
@@ -246,9 +109,11 @@ def filter_by_filename(
         outputs: Output tensor to filter
         target_filename: Filename to filter by
         dataset_name: Name of dataset for logging (e.g., "training", "validation")
+        inputs_features: Optional invariant input features to filter
+        outputs_features: Optional invariant output features to filter
 
     Returns:
-        Filtered inputs and outputs tensors
+        Filtered inputs, outputs, and optionally invariant tensors
 
     Raises:
         ValueError: If no examples found with the target filename (only for non-validation sets)
@@ -264,7 +129,12 @@ def filter_by_filename(
             print(
                 f"Warning: No {dataset_name} examples found with filename: {target_filename}"
             )
-            return torch.empty(0, 30, 30, 11), torch.empty(0, 30, 30, 11)
+            empty_inputs = torch.empty(0, 30, 30, 11)
+            empty_outputs = torch.empty(0, 30, 30, 11)
+            empty_features = (
+                torch.empty(0, 30, 30, 44) if inputs_features is not None else None
+            )
+            return empty_inputs, empty_outputs, empty_features, empty_features
         else:
             raise ValueError(
                 f"No {dataset_name} examples found with filename: {target_filename}"
@@ -273,64 +143,81 @@ def filter_by_filename(
     # Filter the tensors
     filtered_inputs = inputs[filtered_indices]
     filtered_outputs = outputs[filtered_indices]
+
+    filtered_inputs_features = None
+    filtered_outputs_features = None
+    if inputs_features is not None:
+        filtered_inputs_features = inputs_features[filtered_indices]
+    if outputs_features is not None:
+        filtered_outputs_features = outputs_features[filtered_indices]
+
     print(
         f"Found {len(filtered_indices)} {dataset_name} examples with filename {target_filename}"
     )
 
-    return filtered_inputs, filtered_outputs
+    return (
+        filtered_inputs,
+        filtered_outputs,
+        filtered_inputs_features,
+        filtered_outputs_features,
+    )
 
 
 def prepare_dataset(
-    parquet_path: str,
+    npz_path: str,
     filter_filename: Optional[str] = None,
     limit_examples: Optional[int] = None,
-    augment_factor: int = 1,
-    use_mixing_steps: Optional[int] = None,
+    use_features: bool = False,
     dataset_name: str = "data",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load and prepare a dataset from a parquet file with optional filtering and augmentation.
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Load and prepare a dataset from an NPZ file with optional filtering.
 
     Args:
-        parquet_path: Path to the parquet file
+        npz_path: Path to the NPZ file
         filter_filename: Optional filename to filter examples
         limit_examples: Optional limit on number of examples
-        augment_factor: Factor for data augmentation via color permutation
-        use_mixing_steps: Optional number of mixing steps for creating intermediate states
+        use_features: Whether to load invariant features
         dataset_name: Name of dataset for logging
 
     Returns:
-        Prepared inputs and outputs tensors
+        Prepared inputs, outputs, and optionally invariant tensors
     """
-    print(f"Loading {dataset_name} from {parquet_path}...")
-    filenames, _, inputs, outputs = load_parquet_data(parquet_path)
+    print(f"Loading {dataset_name} from {npz_path}...")
+    filenames, _, inputs, outputs, inputs_features, outputs_features = load_npz_data(
+        npz_path, use_features=use_features
+    )
 
     # Apply filtering if requested
     if filter_filename is not None:
-        inputs, outputs = filter_by_filename(
-            filenames, inputs, outputs, filter_filename, dataset_name
+        inputs, outputs, inputs_features, outputs_features = filter_by_filename(
+            filenames,
+            inputs,
+            outputs,
+            filter_filename,
+            dataset_name,
+            inputs_features,
+            outputs_features,
         )
 
     # Apply limit if requested
     if limit_examples is not None:
         inputs = inputs[:limit_examples]
         outputs = outputs[:limit_examples]
+        if inputs_features is not None:
+            inputs_features = inputs_features[:limit_examples]
+        if outputs_features is not None:
+            outputs_features = outputs_features[:limit_examples]
         print(f"Limited to {limit_examples} {dataset_name} examples")
-
-    # Apply augmentation if requested
-    if augment_factor > 1:
-        print(f"Applying {augment_factor}x augmentation to {dataset_name}...")
-        inputs, outputs = repeat_and_permute(inputs, outputs, augment_factor)
-
-    # Apply mixing steps if requested
-    if use_mixing_steps is not None:
-        print(f"Applying mixing steps with n={use_mixing_steps} to {dataset_name}...")
-        inputs, outputs = apply_mixing_steps(inputs, outputs, use_mixing_steps)
 
     print(
         f"{dataset_name.capitalize()} shape: inputs={inputs.shape}, outputs={outputs.shape}"
     )
+    if inputs_features is not None:
+        print(
+            f"{dataset_name.capitalize()} invariant shape: inputs_features={inputs_features.shape}"
+        )
 
-    return inputs, outputs
+    return inputs, outputs, inputs_features, outputs_features
 
 
 def create_dataloader(
@@ -339,6 +226,8 @@ def create_dataloader(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
+    inputs_features: Optional[torch.Tensor] = None,
+    outputs_features: Optional[torch.Tensor] = None,
 ) -> DataLoader[Any]:
     """Create a DataLoader from input and output tensors.
 
@@ -348,11 +237,17 @@ def create_dataloader(
         batch_size: Batch size for the DataLoader
         shuffle: Whether to shuffle the data
         num_workers: Number of worker processes
+        inputs_features: Optional invariant input features
+        outputs_features: Optional invariant output features
 
     Returns:
         DataLoader instance
     """
-    dataset = TensorDataset(inputs, outputs)
+    if inputs_features is not None and outputs_features is not None:
+        dataset = TensorDataset(inputs, outputs, inputs_features, outputs_features)
+    else:
+        dataset = TensorDataset(inputs, outputs)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -367,13 +262,13 @@ if __name__ == "__main__":
 
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        description="Load and display information about processed data"
+        description="Load and display information about processed NPZ data"
     )
     parser.add_argument(
         "--data_path",
         type=str,
-        default="processed_data/train.parquet",
-        help="Path to the processed parquet file",
+        default="processed_data/train.npz",
+        help="Path to the processed NPZ file",
     )
     parser.add_argument(
         "--filename",
@@ -381,12 +276,18 @@ if __name__ == "__main__":
         default="025d127b.json",
         help="Filter examples by filename",
     )
+    parser.add_argument(
+        "--use_features",
+        action="store_true",
+        help="Load and use concatenated features",
+    )
+
     args = parser.parse_args()
 
     # Load the data
-    filenames, indices, inputs, outputs = load_parquet_data(args.data_path)
-
-    binputs, boutputs = repeat_and_permute(inputs, outputs, 5)
+    filenames, indices, inputs, outputs, inputs_features, outputs_features = (
+        load_npz_data(args.data_path, use_features=args.use_features)
+    )
 
     # Print shape information
     print(f"Number of examples: {len(filenames)}")
@@ -394,15 +295,23 @@ if __name__ == "__main__":
     print(f"Indices: {len(indices)} items")
     print(f"Inputs shape: {inputs.shape}")
     print(f"Outputs shape: {outputs.shape}")
+    if inputs_features is not None:
+        print(f"Inputs invariant shape: {inputs_features.shape}")
+        if outputs_features is not None:
+            print(f"Outputs invariant shape: {outputs_features.shape}")
 
     # Late import of terminal_imshow
     from utils.terminal_imshow import imshow
 
     # Filter examples by filename if provided
     if args.filename:
-        filtered_indices: list[int] = [
+        filtered_indices: List[int] = [
             i for i, fname in enumerate(filenames) if fname == args.filename
         ]
+
+        if not filtered_indices:
+            print(f"No examples found with filename: {args.filename}")
+            exit(1)
 
         # Get the first matching example
         idx: int = filtered_indices[0]
@@ -410,19 +319,21 @@ if __name__ == "__main__":
 
         # Display original input and output
         print("\nOriginal Input:")
-
         imshow(one_hot_to_categorical(inputs[idx]))
         print("\nOriginal Output:")
         imshow(one_hot_to_categorical(outputs[idx]))
 
-        # Find the corresponding indices in the permuted batch
-        # Each original example is repeated n times (5 in this case)
-        batch_indices: list[int] = [idx + i * len(filenames) for i in range(5)]
+        # Display invariant features if available
+        if inputs_features is not None:
+            print(f"\nInvariant features for this example:")
+            features = inputs_features[idx]
+            print(f"Features shape: {features.shape}")
+            print(
+                f"Feature value range: {features.min().item():.2f} to {features.max().item():.2f}"
+            )
 
-        # Display all permuted versions
-        for i, batch_idx in enumerate(batch_indices):
-            print(f"\nPermuted version {i+1}:")
-            print("Input:")
-            imshow(one_hot_to_categorical(binputs[batch_idx]))
-            print("Output:")
-            imshow(one_hot_to_categorical(boutputs[batch_idx]))
+            # Show some feature statistics for the center cell
+            center_features = features[15, 15]
+            print(f"Center cell (15,15) features:")
+            print(f"  Pairwise features (first 5): {center_features[:5].numpy()}")  # type: ignore
+            print(f"  Mask features (last 8): {center_features[36:44].numpy()}")  # type: ignore

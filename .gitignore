@@ -12,3 +12,6 @@ wandb
 arc-agi
 lightning_logs
 processed_data
+
+# Python cache directories
+**/__pycache__/

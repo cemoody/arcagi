@@ -1,308 +1,234 @@
+import tempfile
+import unittest
+from pathlib import Path
+from typing import List
+
+import numpy as np
 import torch
 
-from arcagi.data_loader import repeat_and_permute
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _one_hot_from_int(mat: torch.Tensor, num_classes: int = 11) -> torch.Tensor:  # type: ignore
-    """Convert an integer tensor of shape (H, W) (or (B, H, W)) to one-hot with
-    channels on the last axis.
-    """
-
-    assert mat.dim() in (2, 3)
-    if mat.dim() == 2:
-        mat = mat.unsqueeze(0)
-    batch: int = mat.shape[0]
-    height: int = mat.shape[1]
-    width: int = mat.shape[2]
-
-    one_hot: torch.Tensor = torch.zeros(
-        (batch, height, width, num_classes), dtype=torch.float
-    )
-    valid_mask: torch.Tensor = mat >= 0
-    # Only scatter where colour is in [0, num_classes-1]
-    indices: torch.Tensor = mat.clone()
-    indices[~valid_mask] = 0  # placeholder index for invalid positions
-    one_hot[valid_mask.unsqueeze(-1).expand_as(one_hot)] = (
-        0.0  # ensure zero (already zero)
-    )
-    one_hot.scatter_(-1, indices.unsqueeze(-1), 1.0)
-    return one_hot
+from arcagi.data_loader import (
+    create_dataloader,
+    filter_by_filename,
+    load_npz_data,
+    one_hot_to_categorical,
+    prepare_dataset,
+)
 
 
-def _categorical_from_one_hot(one_hot: torch.Tensor) -> torch.Tensor:  # type: ignore
-    cat: torch.Tensor = torch.argmax(one_hot, dim=-1)
-    sum_: torch.Tensor = one_hot.sum(dim=-1)
-    cat[sum_ == 0] = -1
-    return cat
+class TestDataLoaderV2(unittest.TestCase):
+    def setUp(self):
+        """Set up test fixtures with temporary NPZ files."""
+        # Create temporary directory
+        self.temp_dir = tempfile.mkdtemp()
+        self.npz_path = Path(self.temp_dir) / "test_data.npz"
+        self.npz_features_path = Path(self.temp_dir) / "test_data_features.npz"
+
+        # Create test data
+        self.test_inputs = np.array(
+            [
+                [[0, 1], [2, 3]],  # Example 1
+                [[4, 5], [6, 7]],  # Example 2
+                [[8, 9], [-1, 0]],  # Example 3 with mask
+            ],
+            dtype=np.int32,
+        )
+        # Expand to 30x30 matrices filled with -1
+        expanded_inputs = np.full((3, 30, 30), -1, dtype=np.int32)
+        expanded_outputs = np.full((3, 30, 30), -1, dtype=np.int32)
+
+        # Place test data in center
+        for i in range(3):
+            expanded_inputs[i, 14:16, 14:16] = self.test_inputs[i]
+            expanded_outputs[i, 14:16, 14:16] = self.test_inputs[i]
+
+        self.test_filenames = ["file1.json", "file2.json", "file1.json"]
+        self.test_indices = [0, 0, 1]
+
+        # Save basic NPZ file (without features)
+        np.savez(
+            str(self.npz_path),
+            inputs=expanded_inputs,
+            outputs=expanded_outputs,
+            filenames=np.array(self.test_filenames),
+            indices=np.array(self.test_indices),
+        )
+
+        # Create test features data (44-dimensional)
+        test_features = np.random.randint(0, 2, (3, 30, 30, 44), dtype=np.uint8)
+
+        # Save NPZ file with features
+        np.savez(
+            str(self.npz_features_path),
+            inputs=expanded_inputs,
+            outputs=expanded_outputs,
+            filenames=np.array(self.test_filenames),
+            indices=np.array(self.test_indices),
+            inputs_features=test_features,
+            outputs_features=test_features,
+            feature_names=np.array(["order2"], dtype="U32"),
+        )
+
+    def tearDown(self):
+        """Clean up temporary files."""
+        import shutil
+
+        shutil.rmtree(self.temp_dir)
+
+    def test_load_npz_data_basic(self):
+        """Test basic NPZ loading without features."""
+        filenames, indices, inputs, outputs, inputs_features, outputs_features = (
+            load_npz_data(str(self.npz_path), use_features=False)
+        )
+
+        # Check basic properties
+        self.assertEqual(len(filenames), 3)
+        self.assertEqual(len(indices), 3)
+        self.assertEqual(inputs.shape, (3, 30, 30, 11))  # One-hot encoded
+        self.assertEqual(outputs.shape, (3, 30, 30, 11))
+        self.assertIsNone(inputs_features)
+        self.assertIsNone(outputs_features)
+
+        # Check filenames and indices
+        self.assertEqual(filenames, self.test_filenames)
+        self.assertEqual(indices, self.test_indices)
+
+        # Check one-hot encoding for first example
+        # Color 0 should be 1 at position (14, 14) and 0 elsewhere in that channel
+        self.assertEqual(inputs[0, 14, 14, 0].item(), 1.0)  # Color 0
+        self.assertEqual(inputs[0, 14, 15, 1].item(), 1.0)  # Color 1
+        self.assertEqual(inputs[0, 15, 14, 2].item(), 1.0)  # Color 2
+        self.assertEqual(inputs[0, 15, 15, 3].item(), 1.0)  # Color 3
+
+        # Check mask encoding (-1 should map to channel 10)
+        self.assertEqual(inputs[0, 0, 0, 10].item(), 1.0)  # Mask at (0,0)
+
+    def test_load_npz_data_with_features(self):
+        """Test NPZ loading with features."""
+        filenames, indices, inputs, outputs, inputs_features, outputs_features = (
+            load_npz_data(str(self.npz_features_path), use_features=True)
+        )
+
+        # Check basic properties
+        self.assertEqual(len(filenames), 3)
+        self.assertEqual(inputs.shape, (3, 30, 30, 11))
+        self.assertEqual(outputs.shape, (3, 30, 30, 11))
+
+        # Check features
+        self.assertIsNotNone(inputs_features)
+        self.assertIsNotNone(outputs_features)
+        self.assertEqual(inputs_features.shape, (3, 30, 30, 44))
+        self.assertEqual(outputs_features.shape, (3, 30, 30, 44))
+        self.assertEqual(inputs_features.dtype, torch.uint8)
+
+    def test_one_hot_to_categorical(self):
+        """Test conversion from one-hot to categorical."""
+        # Create simple one-hot tensor
+        one_hot = torch.zeros(2, 2, 11)
+        one_hot[0, 0, 5] = 1  # Color 5
+        one_hot[0, 1, 10] = 1  # Mask
+        one_hot[1, 0, 0] = 1  # Color 0
+        one_hot[1, 1, 9] = 1  # Color 9
+
+        categorical = one_hot_to_categorical(one_hot)
+
+        self.assertEqual(categorical[0, 0].item(), 5)
+        self.assertEqual(categorical[0, 1].item(), 10)  # Mask
+        self.assertEqual(categorical[1, 0].item(), 0)
+        self.assertEqual(categorical[1, 1].item(), 9)
+
+    def test_filter_by_filename(self):
+        """Test filtering by filename."""
+        filenames, indices, inputs, outputs, inputs_features, outputs_features = (
+            load_npz_data(str(self.npz_path), use_features=False)
+        )
+
+        # Filter by "file1.json" (should get examples 0 and 2)
+        (
+            filtered_inputs,
+            filtered_outputs,
+            filtered_features_in,
+            filtered_features_out,
+        ) = filter_by_filename(filenames, inputs, outputs, "file1.json", "test")
+
+        self.assertEqual(filtered_inputs.shape[0], 2)  # Two examples
+        self.assertEqual(filtered_outputs.shape[0], 2)
+        self.assertIsNone(filtered_features_in)
+        self.assertIsNone(filtered_features_out)
+
+    def test_prepare_dataset(self):
+        """Test dataset preparation."""
+        inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+            str(self.npz_path), use_features=False
+        )
+
+        self.assertEqual(inputs.shape, (3, 30, 30, 11))
+        self.assertEqual(outputs.shape, (3, 30, 30, 11))
+        self.assertIsNone(inputs_features)
+        self.assertIsNone(outputs_features)
+
+    def test_prepare_dataset_with_features(self):
+        """Test dataset preparation with features."""
+        inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+            str(self.npz_features_path), use_features=True
+        )
+
+        self.assertEqual(inputs.shape, (3, 30, 30, 11))
+        self.assertEqual(outputs.shape, (3, 30, 30, 11))
+        self.assertIsNotNone(inputs_features)
+        self.assertIsNotNone(outputs_features)
+        self.assertEqual(inputs_features.shape, (3, 30, 30, 44))
+        self.assertEqual(outputs_features.shape, (3, 30, 30, 44))
+
+    def test_create_dataloader(self):
+        """Test DataLoader creation."""
+        inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+            str(self.npz_path), use_features=False
+        )
+
+        dataloader = create_dataloader(
+            inputs, outputs, batch_size=2, shuffle=False, num_workers=0
+        )
+
+        # Test that we can iterate through the dataloader
+        batches: List = list(dataloader)
+        self.assertEqual(len(batches), 2)  # 3 examples, batch_size=2 -> 2 batches
+
+        # Check first batch
+        batch_inputs, batch_outputs = batches[0]
+        self.assertEqual(batch_inputs.shape, (2, 30, 30, 11))
+        self.assertEqual(batch_outputs.shape, (2, 30, 30, 11))
+
+    def test_create_dataloader_with_features(self):
+        """Test DataLoader creation with features."""
+        inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+            str(self.npz_features_path), use_features=True
+        )
+
+        dataloader = create_dataloader(
+            inputs,
+            outputs,
+            batch_size=2,
+            shuffle=False,
+            num_workers=0,
+            inputs_features=inputs_features,
+            outputs_features=outputs_features,
+        )
+
+        # Test that we can iterate through the dataloader
+        batches: List = list(dataloader)
+        self.assertEqual(len(batches), 2)  # 3 examples, batch_size=2 -> 2 batches
+
+        # Check first batch (should have 4 tensors: inputs, outputs, inputs_features, outputs_features)
+        batch = batches[0]
+        self.assertEqual(len(batch), 4)
+        batch_inputs, batch_outputs, batch_inputs_features, batch_outputs_features = (
+            batch
+        )
+        self.assertEqual(batch_inputs.shape, (2, 30, 30, 11))
+        self.assertEqual(batch_outputs.shape, (2, 30, 30, 11))
+        self.assertEqual(batch_inputs_features.shape, (2, 30, 30, 44))
+        self.assertEqual(batch_outputs_features.shape, (2, 30, 30, 44))
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-def test_batch_generate_color_mapping_independent_per_sample() -> None:
-    """Verify that *batch_generate_color_mapping* applies
-    sample-wise-independent permutations while keeping input/output aligned."""
-
-    from arcagi.data_loader import batch_generate_color_mapping
-
-    # Construct a random batch of categorical colour grids (B, H, W) with
-    # values in [0, 10]. Use -1 for ~20% of cells.
-    torch.manual_seed(123)  # type: ignore[arg-type]
-    batch_size: int = 5
-    height: int = 30
-    width: int = 30
-
-    rand_vals: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
-    mask_invalid: torch.Tensor = torch.rand(batch_size, height, width) < 0.2
-    rand_vals = rand_vals.masked_fill(mask_invalid, -1)
-
-    inputs_one_hot: torch.Tensor = _one_hot_from_int(rand_vals)
-    # For outputs, just copy inputs so colours are aligned before permutation.
-    outputs_one_hot: torch.Tensor = inputs_one_hot.clone()
-
-    perm_inputs, perm_outputs = batch_generate_color_mapping(
-        inputs_one_hot, outputs_one_hot
-    )
-
-    # Shapes must be preserved.
-    assert perm_inputs.shape == inputs_one_hot.shape
-    assert perm_outputs.shape == outputs_one_hot.shape
-
-    # Convert back to categorical for easier reasoning.
-    orig_cat: torch.Tensor = rand_vals  # (B, H, W)
-    perm_inp_cat: torch.Tensor = _categorical_from_one_hot(perm_inputs)
-    perm_out_cat: torch.Tensor = _categorical_from_one_hot(perm_outputs)
-
-    # For each sample check:
-    # 1) There exists a one-to-one mapping between orig_cat and perm_inp_cat.
-    # 2) The same mapping applies to perm_out_cat.
-    # 3) The mapping is a permutation of 0-10.
-    # Additionally, at least two samples should have distinct permutations.
-
-    mappings: list[dict[int, int]] = []  # type: ignore
-
-    for b in range(batch_size):
-        mapping: dict[int, int] = {}
-        for h in range(height):
-            for w in range(width):
-                old_col: int = int(orig_cat[b, h, w].item())
-                if old_col == -1:
-                    # Ignore padding cells.
-                    continue
-                new_col: int = int(perm_inp_cat[b, h, w].item())
-                # Consistency: if we've already seen old_col, mapping must match.
-                if old_col in mapping:
-                    assert mapping[old_col] == new_col
-                else:
-                    mapping[old_col] = new_col
-        # Ensure it is a permutation (11 distinct colours).
-        assert set(mapping.keys()) == set(range(11))
-        assert set(mapping.values()) == set(range(11))
-
-        # Verify outputs follow the same mapping.
-        for h in range(height):
-            for w in range(width):
-                old_col: int = int(orig_cat[b, h, w].item())
-                if old_col == -1:
-                    continue
-                expected_new: int = mapping[old_col]
-                actual_new: int = int(perm_out_cat[b, h, w].item())
-                assert expected_new == actual_new
-
-        mappings.append(mapping)
-
-    # Check that at least two mappings differ (highly likely with random perms).
-    unique_mappings: set[tuple[int, ...]] = {
-        tuple(m[k] for k in sorted(m)) for m in mappings
-    }
-    assert len(unique_mappings) > 1, "Expected independent permutations across samples"
-
-
-def test_repeat_and_permute():
-    """Test that repeat_and_permute correctly repeats and permutes the input and output tensors."""
-    # Create a small test dataset
-    batch_size: int = 3
-    height: int = 30
-    width: int = 30
-    channels: int = 11
-    n_repeats: int = 4
-
-    # Create random one-hot encoded inputs and outputs
-    rand_vals: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
-    inputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
-    outputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
-
-    # Fill in one-hot encoded values
-    for b in range(batch_size):
-        for h in range(height):
-            for w in range(width):
-                color: int = int(rand_vals[b, h, w].item())
-                inputs[b, h, w, color] = 1.0
-                outputs[b, h, w, color] = 1.0
-
-    # Apply repeat_and_permute
-    repeated_inputs, repeated_outputs = repeat_and_permute(inputs, outputs, n_repeats)
-
-    # Check shapes
-    assert repeated_inputs.shape == (batch_size * n_repeats, height, width, channels)
-    assert repeated_outputs.shape == (batch_size * n_repeats, height, width, channels)
-
-    # Convert to categorical for easier verification
-    repeated_inputs_cat: torch.Tensor = _categorical_from_one_hot(repeated_inputs)
-    repeated_outputs_cat: torch.Tensor = _categorical_from_one_hot(repeated_outputs)
-
-    # Verify that each original sample is repeated n_repeats times with different permutations
-    for orig_idx in range(batch_size):
-        # Get the indices in the repeated tensor for this original sample
-        repeat_indices: list[int] = [
-            orig_idx + i * batch_size for i in range(n_repeats)
-        ]
-
-        # For each repeated instance, verify it's a valid permutation of the original
-        permutation_mappings: list[dict[int, int]] = []
-
-        for repeat_idx in repeat_indices:
-            # Build the color mapping for this repeated instance
-            mapping: dict[int, int] = {}
-
-            # Sample a few points to build the mapping
-            for h in range(0, height, 5):  # Sample every 5th point to save time
-                for w in range(0, width, 5):
-                    orig_color: int = int(rand_vals[orig_idx, h, w].item())
-                    if orig_color == -1:
-                        continue
-                    new_color: int = int(repeated_inputs_cat[repeat_idx, h, w].item())
-
-                    if orig_color in mapping:
-                        assert (
-                            mapping[orig_color] == new_color
-                        ), "Inconsistent mapping within a sample"
-                    else:
-                        mapping[orig_color] = new_color
-
-            # Verify it's a valid permutation
-            if len(mapping) == 11:  # Only check if we found all colors
-                assert set(mapping.keys()) == set(range(11))
-                assert set(mapping.values()) == set(range(11))
-
-            # Verify inputs and outputs have the same mapping
-            for h in range(0, height, 5):
-                for w in range(0, width, 5):
-                    orig_color: int = int(rand_vals[orig_idx, h, w].item())
-                    if orig_color == -1 or orig_color not in mapping:
-                        continue
-                    expected_color: int = mapping[orig_color]
-                    actual_color_input: int = int(
-                        repeated_inputs_cat[repeat_idx, h, w].item()
-                    )
-                    actual_color_output: int = int(
-                        repeated_outputs_cat[repeat_idx, h, w].item()
-                    )
-
-                    assert expected_color == actual_color_input
-                    assert expected_color == actual_color_output
-
-            permutation_mappings.append(mapping)
-
-        # Check that the permutations are different for each repeat
-        if all(len(m) == 11 for m in permutation_mappings):
-            unique_mappings: set[tuple[int, ...]] = {
-                tuple(m[k] for k in sorted(m)) for m in permutation_mappings
-            }
-            # With random permutations, it's highly unlikely all would be the same
-            assert (
-                len(unique_mappings) > 1
-            ), "Expected different permutations for repeated samples"
-
-
-def test_apply_mixing_steps():
-    """Test that apply_mixing_steps correctly creates intermediate states."""
-    from arcagi.data_loader import apply_mixing_steps
-
-    # Create a simple test case with known values
-    batch_size: int = 4
-    height: int = 30
-    width: int = 30
-    channels: int = 11
-    n_steps: int = 4
-
-    # Create simple inputs and outputs where we can verify the mixing
-    # Input: all pixels are color 0 (one-hot)
-    # Output: all pixels are color 1 (one-hot)
-    inputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
-    outputs: torch.Tensor = torch.zeros((batch_size, height, width, channels))
-
-    inputs[:, :, :, 0] = 1.0  # All pixels are color 0
-    outputs[:, :, :, 1] = 1.0  # All pixels are color 1
-
-    # Apply mixing steps
-    mixed_inputs, mixed_outputs = apply_mixing_steps(inputs, outputs, n_steps)
-
-    # Check shapes are preserved
-    assert mixed_inputs.shape == inputs.shape
-    assert mixed_outputs.shape == outputs.shape
-
-    # For each sample, verify the mixing is correct
-    for b in range(batch_size):
-        # Get the value at channel 0 and 1 for a sample pixel
-        input_ch0: float = mixed_inputs[b, 0, 0, 0].item()
-        input_ch1: float = mixed_inputs[b, 0, 0, 1].item()
-        output_ch0: float = mixed_outputs[b, 0, 0, 0].item()
-        output_ch1: float = mixed_outputs[b, 0, 0, 1].item()
-
-        # The fraction f should be one of {0, 0.25, 0.5, 0.75}
-        # For mixed_input: ch0 = f, ch1 = (1-f)
-        # For mixed_output: ch0 = (f - 0.25), ch1 = (1 - f + 0.25)
-
-        # Determine which f was used based on input_ch0
-        f: float = input_ch0
-
-        # Verify f is one of the expected values
-        assert f in [0.0, 0.25, 0.5, 0.75] or abs(f - round(f * 4) / 4) < 1e-6
-
-        # Verify the mixing formulas
-        assert abs(input_ch1 - (1 - f)) < 1e-6
-
-        # For output, when f = 0, we expect ch0 = -0.25, ch1 = 1.25
-        # But it should be clamped to [0, 1]
-        expected_output_ch0: float = max(0.0, f - 0.25)
-        expected_output_ch1: float = min(1.0, 1 - f + 0.25)
-
-        assert abs(output_ch0 - expected_output_ch0) < 1e-6
-        assert abs(output_ch1 - expected_output_ch1) < 1e-6
-
-        # Verify all channels sum to 1 (valid probability distribution)
-        input_sum: float = mixed_inputs[b, 0, 0, :].sum().item()
-        output_sum: float = mixed_outputs[b, 0, 0, :].sum().item()
-        assert abs(input_sum - 1.0) < 1e-6
-        assert abs(output_sum - 1.0) < 1e-6
-
-    # Test with more complex case - different colors
-    torch.manual_seed(42)  # type: ignore[arg-type]
-    rand_input_colors: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
-    rand_output_colors: torch.Tensor = torch.randint(0, 11, (batch_size, height, width))
-
-    complex_inputs: torch.Tensor = _one_hot_from_int(rand_input_colors)
-    complex_outputs: torch.Tensor = _one_hot_from_int(rand_output_colors)
-
-    mixed_inputs, mixed_outputs = apply_mixing_steps(
-        complex_inputs, complex_outputs, n_steps
-    )
-
-    # Verify probability distributions are valid
-    assert torch.all(mixed_inputs >= 0)
-    assert torch.all(mixed_inputs <= 1)
-    assert torch.all(mixed_outputs >= 0)
-    assert torch.all(mixed_outputs <= 1)
-
-    # Verify sums are approximately 1
-    input_sums: torch.Tensor = mixed_inputs.sum(dim=-1)
-    output_sums: torch.Tensor = mixed_outputs.sum(dim=-1)
-    assert torch.allclose(input_sums, torch.ones_like(input_sums), atol=1e-6)
-    assert torch.allclose(output_sums, torch.ones_like(output_sums), atol=1e-6)
+if __name__ == "__main__":
+    unittest.main()
