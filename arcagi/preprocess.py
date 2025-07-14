@@ -1,5 +1,5 @@
-from pathlib import Path
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -105,13 +105,14 @@ def save_data_to_parquet(
         subset: Subset of data to load ("train", "test", etc.)
         filename_filter: Optional filter for specific filenames
     """
-    import pandas as pd
     import numpy as np
+    import pandas as pd
 
     # Load the data
     filenames, indices, inputs_tensor, outputs_tensor = load_data_from_directory(
         directory, subset, filename_filter
     )
+    breakpoint()
 
     # Create metadata DataFrame
     metadata_df = pd.DataFrame(
@@ -129,14 +130,14 @@ def save_data_to_parquet(
     input_dict: Dict[str, np.ndarray] = {}  # type: ignore
     for i in range(30):
         for j in range(30):
-            col_name = f"input_{i}_{j}"
+            col_name = f"input_{i:02d}_{j:02d}"
             input_dict[col_name] = inputs_np[:, i, j]
 
     # Create output columns dictionary
     output_dict: Dict[str, np.ndarray] = {}  # type: ignore
     for i in range(30):
         for j in range(30):
-            col_name = f"output_{i}_{j}"
+            col_name = f"output_{i:02d}_{j:02d}"
             output_dict[col_name] = outputs_np[:, i, j]
 
     # Create separate DataFrames
