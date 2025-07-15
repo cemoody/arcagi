@@ -16,6 +16,7 @@ def load_npz_data(
     torch.Tensor,
     Optional[torch.Tensor],
     Optional[torch.Tensor],
+    Optional[NDArray[np.bool_]],
 ]:
     """
     Loads data from an NPZ file created by preprocess_v2.py and creates PyTorch tensors.
@@ -31,6 +32,7 @@ def load_npz_data(
         outputs: torch.Tensor of shape (n_examples, 30, 30, 11) with one-hot encoded colors
         inputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
         outputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
+        subset_example_index_is_train: np.ndarray of booleans indicating if example is from "train" subset (True) or "test" subset (False)
     """
     # Load the NPZ file
     data = np.load(npz_path)
@@ -40,6 +42,11 @@ def load_npz_data(
     indices: List[int] = data["indices"].tolist()
     inputs_raw: NDArray[np.int32] = data["inputs"]  # Shape: (n_examples, 30, 30)
     outputs_raw: NDArray[np.int32] = data["outputs"]  # Shape: (n_examples, 30, 30)
+
+    # Load subset information if available
+    subset_example_index_is_train = None
+    if "subset_example_index_is_train" in data:
+        subset_example_index_is_train = data["subset_example_index_is_train"]
 
     # Get number of examples
     num_examples: int = len(filenames)
@@ -78,7 +85,15 @@ def load_npz_data(
         else:
             print("Warning: Features requested but not found in NPZ file")
 
-    return filenames, indices, inputs, outputs, inputs_features, outputs_features
+    return (
+        filenames,
+        indices,
+        inputs,
+        outputs,
+        inputs_features,
+        outputs_features,
+        subset_example_index_is_train,
+    )
 
 
 def one_hot_to_categorical(
@@ -163,12 +178,79 @@ def filter_by_filename(
     )
 
 
+def filter_by_subset(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+    subset_is_train: Optional[NDArray[np.bool_]],
+    use_train_subset: bool = True,
+    inputs_features: Optional[torch.Tensor] = None,
+    outputs_features: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Filter tensors to only include examples from a specific subset (train or test within files).
+
+    Args:
+        inputs: Input tensor to filter
+        outputs: Output tensor to filter
+        subset_is_train: Boolean array indicating which examples are from "train" subset
+        use_train_subset: If True, return examples from "train" subset; if False, return examples from "test" subset
+        inputs_features: Optional input features to filter
+        outputs_features: Optional output features to filter
+
+    Returns:
+        Filtered inputs, outputs, and optionally feature tensors
+    """
+    if subset_is_train is None:
+        print("Warning: No subset information available, returning all examples")
+        return inputs, outputs, inputs_features, outputs_features
+
+    # Create mask for the desired subset
+    if use_train_subset:
+        mask = subset_is_train
+        subset_name = "train"
+    else:
+        mask = ~subset_is_train
+        subset_name = "test"
+
+    # Find indices that match the subset
+    filtered_indices = np.where(mask)[0]
+
+    if len(filtered_indices) == 0:
+        print(f"Warning: No examples found in {subset_name} subset")
+        empty_inputs = torch.empty(0, 30, 30, 11)
+        empty_outputs = torch.empty(0, 30, 30, 11)
+        empty_features = (
+            torch.empty(0, 30, 30, 44) if inputs_features is not None else None
+        )
+        return empty_inputs, empty_outputs, empty_features, empty_features
+
+    # Filter the tensors
+    filtered_inputs = inputs[filtered_indices]
+    filtered_outputs = outputs[filtered_indices]
+
+    filtered_inputs_features = None
+    filtered_outputs_features = None
+    if inputs_features is not None:
+        filtered_inputs_features = inputs_features[filtered_indices]
+    if outputs_features is not None:
+        filtered_outputs_features = outputs_features[filtered_indices]
+
+    print(f"Found {len(filtered_indices)} examples in {subset_name} subset")
+
+    return (
+        filtered_inputs,
+        filtered_outputs,
+        filtered_inputs_features,
+        filtered_outputs_features,
+    )
+
+
 def prepare_dataset(
     npz_path: str,
     filter_filename: Optional[str] = None,
     limit_examples: Optional[int] = None,
     use_features: bool = False,
     dataset_name: str = "data",
+    use_train_subset: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Load and prepare a dataset from an NPZ file with optional filtering.
 
@@ -178,19 +260,44 @@ def prepare_dataset(
         limit_examples: Optional limit on number of examples
         use_features: Whether to load invariant features
         dataset_name: Name of dataset for logging
+        use_train_subset: Optional bool to filter by subset (True=train subset, False=test subset, None=all)
 
     Returns:
         Prepared inputs, outputs, and optionally invariant tensors
     """
     print(f"Loading {dataset_name} from {npz_path}...")
-    filenames, _, inputs, outputs, inputs_features, outputs_features = load_npz_data(
-        npz_path, use_features=use_features
-    )
+    (
+        filenames,
+        _,
+        inputs,
+        outputs,
+        inputs_features,
+        outputs_features,
+        subset_is_train,
+    ) = load_npz_data(npz_path, use_features=use_features)
 
-    # Apply filtering if requested
+    # Apply subset filtering if requested
+    if use_train_subset is not None:
+        inputs, outputs, inputs_features, outputs_features = filter_by_subset(
+            inputs,
+            outputs,
+            subset_is_train,
+            use_train_subset,
+            inputs_features,
+            outputs_features,
+        )
+
+    # Apply filename filtering if requested
     if filter_filename is not None:
+        # We need to update filenames list if subset filtering was applied
+        if use_train_subset is not None and subset_is_train is not None:
+            mask = subset_is_train if use_train_subset else ~subset_is_train
+            filtered_filenames: List[str] = [filenames[i] for i in np.where(mask)[0]]
+        else:
+            filtered_filenames = filenames
+
         inputs, outputs, inputs_features, outputs_features = filter_by_filename(
-            filenames,
+            filtered_filenames,
             inputs,
             outputs,
             filter_filename,
@@ -257,6 +364,76 @@ def create_dataloader(
     )
 
 
+def load_feature_data(
+    train_path: str,
+    val_path: str,
+    filename_filter: Optional[str] = None,
+    use_features: bool = True,
+    use_train_subset: Optional[bool] = None,
+    use_val_subset: Optional[bool] = None,
+    data_augment_factor: int = 1,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """
+    Load training and validation feature data with subset filtering support.
+
+    Args:
+        train_path: Path to training NPZ file
+        val_path: Path to validation NPZ file
+        filename_filter: Optional filename to filter by
+        use_features: Whether to load and use features
+        use_train_subset: Filter train data by subset (True=train subset, False=test subset, None=all)
+        use_val_subset: Filter val data by subset (True=train subset, False=test subset, None=all)
+        data_augment_factor: Factor to repeat data for augmentation
+
+    Returns:
+        train_inputs, train_outputs, train_features, val_inputs, val_outputs, val_features
+    """
+    # Load training data
+    train_inputs, train_outputs, train_inputs_features, _ = prepare_dataset(
+        train_path,
+        filter_filename=filename_filter,
+        use_features=use_features,
+        dataset_name="training",
+        use_train_subset=use_train_subset,
+    )
+
+    # Load validation data
+    val_inputs, val_outputs, val_inputs_features, _ = prepare_dataset(
+        val_path,
+        filter_filename=filename_filter,
+        use_features=use_features,
+        dataset_name="validation",
+        use_train_subset=use_val_subset,
+    )
+
+    # Apply data augmentation if requested
+    if data_augment_factor > 1:
+        print(f"Applying data augmentation factor: {data_augment_factor}")
+        train_inputs = train_inputs.repeat(data_augment_factor, 1, 1, 1)
+        train_outputs = train_outputs.repeat(data_augment_factor, 1, 1, 1)
+        if train_inputs_features is not None:
+            train_inputs_features = train_inputs_features.repeat(
+                data_augment_factor, 1, 1, 1
+            )
+
+    # Handle case where features are not available
+    if train_inputs_features is None:
+        train_inputs_features = torch.empty(train_inputs.shape[0], 30, 30, 0)
+    if val_inputs_features is None:
+        val_inputs_features = torch.empty(val_inputs.shape[0], 30, 30, 0)
+
+    return (
+        train_inputs,
+        train_outputs,
+        train_inputs_features,
+        val_inputs,
+        val_outputs,
+        val_inputs_features,
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -285,9 +462,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load the data
-    filenames, indices, inputs, outputs, inputs_features, outputs_features = (
-        load_npz_data(args.data_path, use_features=args.use_features)
-    )
+    (
+        filenames,
+        indices,
+        inputs,
+        outputs,
+        inputs_features,
+        outputs_features,
+        subset_is_train,
+    ) = load_npz_data(args.data_path, use_features=args.use_features)
 
     # Print shape information
     print(f"Number of examples: {len(filenames)}")
@@ -299,6 +482,13 @@ if __name__ == "__main__":
         print(f"Inputs invariant shape: {inputs_features.shape}")
         if outputs_features is not None:
             print(f"Outputs invariant shape: {outputs_features.shape}")
+
+    # Print subset information if available
+    if subset_is_train is not None:
+        train_count = subset_is_train.sum()
+        test_count = len(subset_is_train) - train_count
+        print(f"Examples from 'train' subset: {train_count}")
+        print(f"Examples from 'test' subset: {test_count}")
 
     # Late import of terminal_imshow
     from utils.terminal_imshow import imshow

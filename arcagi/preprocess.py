@@ -327,7 +327,6 @@ def compute_is_mask_features(matrix: NDArray[np.int32]) -> NDArray[np.uint8]:
 
 def load_data_from_directory(
     directory: str,
-    subset: str,
     filename_filter: Optional[str] = None,
     feature_order2: bool = False,
     feature_order3: bool = False,
@@ -337,6 +336,7 @@ def load_data_from_directory(
 ) -> Tuple[
     List[str],
     List[int],
+    List[bool],
     NDArray[np.int32],
     NDArray[np.int32],
     Optional[NDArray[np.uint8]],
@@ -352,13 +352,11 @@ def load_data_from_directory(
 ]:
     """
     Loads JSON files from a given directory.
-    For each JSON file, it reads the list of examples under the key `subset`
-    (e.g., "train" or "test"), expands the input and output matrices,
-    and aggregates the data.
+    For each JSON file, it reads BOTH "train" and "test" subsets,
+    expands the input and output matrices, and aggregates the data.
 
     Args:
         directory: Directory containing JSON files
-        subset: Subset key to load ("train", "test", etc.)
         filename_filter: Optional filter for specific filenames
         feature_order2: Whether to compute order-2 (pairwise) relational features
         feature_order3: Whether to compute order-3 (triplet) relational features
@@ -369,6 +367,7 @@ def load_data_from_directory(
     Returns:
         filenames: List of filename strings
         indices: List of example indices within each file
+        subset_example_index_is_train: List of booleans indicating if example is from "train" subset (True) or "test" subset (False)
         inputs_array: numpy array of shape (n_examples, 30, 30) with int32 dtype
         outputs_array: numpy array of shape (n_examples, 30, 30) with int32 dtype
         inputs_order2: numpy array of shape (n_examples, 30, 30, 44) with uint8 dtype (if feature_order2=True, else None)
@@ -384,25 +383,47 @@ def load_data_from_directory(
     """
     filenames: List[str] = []
     indices: List[int] = []
+    subset_example_index_is_train: List[bool] = []
     inputs_expanded: List[List[List[int]]] = []  # Each inner element is 30x30.
     outputs_expanded: List[List[List[int]]] = []
 
     path: Path = Path(directory)
     json_files: List[Path] = sorted(list(path.glob("*.json")))
 
-    for json_file in tqdm(json_files, desc=f"Loading {subset} data"):
+    # Always load both train and test subsets
+    for json_file in tqdm(json_files, desc=f"Loading data from {directory}"):
         with json_file.open("r") as f:
             data: Dict[str, Any] = json.load(f)
-        if subset not in data:
-            raise ValueError(f"File {json_file.name} does not have the '{subset}' key.")
-        examples: List[Dict[str, Any]] = data[subset]
-        for idx, example in enumerate(examples):
-            filenames.append(json_file.name)
-            indices.append(idx)
-            input_colors: List[List[int]] = example["input"]
-            output_colors: List[List[int]] = example["output"]
-            inputs_expanded.append(expand_matrix(input_colors))
-            outputs_expanded.append(expand_matrix(output_colors))
+
+        # Process "train" subset if it exists
+        if "train" in data:
+            examples: List[Dict[str, Any]] = data["train"]
+            for idx, example in enumerate(examples):
+                filenames.append(json_file.name)
+                indices.append(idx)
+                subset_example_index_is_train.append(
+                    True
+                )  # This is from "train" subset
+                input_colors: List[List[int]] = example["input"]
+                output_colors: List[List[int]] = example["output"]
+                inputs_expanded.append(expand_matrix(input_colors))
+                outputs_expanded.append(expand_matrix(output_colors))
+
+        # Process "test" subset if it exists
+        if "test" in data:
+            examples: List[Dict[str, Any]] = data["test"]
+            # Continue numbering from where train left off
+            train_count = len(data.get("train", []))
+            for idx, example in enumerate(examples):
+                filenames.append(json_file.name)
+                indices.append(train_count + idx)  # Continue index numbering
+                subset_example_index_is_train.append(
+                    False
+                )  # This is from "test" subset
+                input_colors: List[List[int]] = example["input"]
+                output_colors: List[List[int]] = example["output"]
+                inputs_expanded.append(expand_matrix(input_colors))
+                outputs_expanded.append(expand_matrix(output_colors))
 
     # Filter by filename if specified
     if filename_filter is not None:
@@ -412,6 +433,11 @@ def load_data_from_directory(
         # Apply mask to filter data
         filenames = [filenames[i] for i in range(len(filenames)) if mask[i]]
         indices = [indices[i] for i in range(len(indices)) if mask[i]]
+        subset_example_index_is_train = [
+            subset_example_index_is_train[i]
+            for i in range(len(subset_example_index_is_train))
+            if mask[i]
+        ]
 
         # Filter expanded inputs and outputs before converting to arrays
         inputs_expanded = [
@@ -534,6 +560,7 @@ def load_data_from_directory(
     return (
         filenames,
         indices,
+        subset_example_index_is_train,
         inputs_array,
         outputs_array,
         inputs_order2,
@@ -610,7 +637,6 @@ def compute_filename_color_mapping(
 def save_data_to_npz(
     directory: str,
     output_path: str,
-    subset: str = "train",
     filename_filter: Optional[str] = None,
     feature_order2: bool = False,
     feature_order3: bool = False,
@@ -626,7 +652,6 @@ def save_data_to_npz(
     Args:
         directory: Directory containing the JSON files
         output_path: Path to save the NPZ file
-        subset: Subset of data to load ("train", "test", etc.)
         filename_filter: Optional filter for specific filenames
         feature_order2: Whether to compute and save order-2 relational features (44 features)
         feature_order3: Whether to compute and save order-3 relational features (84 features)
@@ -639,6 +664,7 @@ def save_data_to_npz(
         - outputs: (n_examples, 30, 30) int32 array with color values
         - filenames: array of source JSON filenames
         - indices: array of example indices within each JSON file
+        - subset_example_index_is_train: boolean array indicating if example is from "train" (True) or "test" (False) subset
         - inputs_features: (n_examples, 30, 30, n_features) uint8 array with concatenated features (if any features enabled)
         - outputs_features: (n_examples, 30, 30, n_features) uint8 array with concatenated features (if any features enabled)
         - feature_names: array of feature type names (if any features enabled)
@@ -647,6 +673,7 @@ def save_data_to_npz(
     (
         filenames,
         indices,
+        subset_example_index_is_train,
         inputs_array,
         outputs_array,
         inputs_order2,
@@ -661,7 +688,6 @@ def save_data_to_npz(
         outputs_ncells_matching_center,
     ) = load_data_from_directory(
         directory,
-        subset,
         filename_filter,
         feature_order2,
         feature_order3,
@@ -674,10 +700,19 @@ def save_data_to_npz(
     print(f"Inputs shape: {inputs_array.shape}, dtype: {inputs_array.dtype}")
     print(f"Outputs shape: {outputs_array.shape}, dtype: {outputs_array.dtype}")
 
+    # Count train vs test examples
+    train_count = sum(subset_example_index_is_train)
+    test_count = len(subset_example_index_is_train) - train_count
+    print(f"Examples from 'train' subset: {train_count}")
+    print(f"Examples from 'test' subset: {test_count}")
+
     # Compute filename to color mapping
     filename_colors_keys, filename_colors_values = compute_filename_color_mapping(
         filenames, inputs_array
     )
+
+    inputs_mask = (inputs_array != -1) & (inputs_array != 10)
+    outputs_mask = (outputs_array != -1) & (outputs_array != 10)
 
     # Prepare data to save
     save_data = {
@@ -685,8 +720,13 @@ def save_data_to_npz(
         "outputs": outputs_array,
         "filenames": np.array(filenames),
         "indices": np.array(indices, dtype=np.int32),
+        "subset_example_index_is_train": np.array(
+            subset_example_index_is_train, dtype=bool
+        ),
         "filename_colors_keys": filename_colors_keys,
         "filename_colors_values": filename_colors_values,
+        "inputs_mask": inputs_mask,
+        "outputs_mask": outputs_mask,
     }
 
     # Concatenate all features into single tensors
@@ -865,7 +905,6 @@ if __name__ == "__main__":
         save_data_to_npz(
             train_dir,
             train_output,
-            subset="train",
             feature_order2=args.feature_order2,
             feature_order3=args.feature_order3,
             feature_ncolors=args.feature_ncolors,
@@ -882,7 +921,6 @@ if __name__ == "__main__":
         save_data_to_npz(
             eval_dir,
             eval_output,
-            subset="test",
             feature_order2=args.feature_order2,
             feature_order3=args.feature_order3,
             feature_ncolors=args.feature_ncolors,
