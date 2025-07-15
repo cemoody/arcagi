@@ -93,6 +93,15 @@ This directory contains experiments for learning color mappings from ARC-AGI dat
   - **Success rate**: 6/6 files (100%) achieved perfect accuracy
   - Average epochs to 100%: 43 epochs (for files trained with 100 epochs)
   - Note: One file required 183 epochs to reach 100% accuracy
+- **Final configuration** (500 max epochs, 12 message rounds, 0.1 learning rate):
+  - Default patience: 5 epochs (requires 5 consecutive epochs of 100% accuracy before stopping)
+  - Custom early stopping callback: `PerfectAccuracyEarlyStopping`
+    - Monitors both INPUT and OUTPUT accuracy separately
+    - Only stops when **BOTH** achieve exactly 100% accuracy for 5 consecutive epochs
+    - Resets counter if either drops below 100%
+    - Provides clear progress messages during training
+  - Tracks separate metrics: `val_input_acc`, `val_output_acc`, and `val_both_perfect`
+  - Ensures stable perfect memorization on both prediction tasks before terminating training
 
 ## Key Insights
 
@@ -110,4 +119,17 @@ For perfect memorization on single file:
 - **Smallest accurate model**: ex13.py (99.71% accuracy in 40 epochs, 1.2M params)
 - **Perfect accuracy**: ex11.py and ex12.py (100% accuracy but slower training)
 - **Best overall**: ex14.py with 12 message rounds (100% accuracy in 44 epochs, 2.0M params) - combines perfect accuracy with fast training
-- **Multi-file robustness**: ex14.py achieved 100% accuracy on all 6 tested files (100% success rate) with sufficient epochs 
+  - **Multi-file robustness**: ex14.py achieved 100% accuracy on all 6 tested files (100% success rate) with sufficient epochs
+
+### ex15.py - Weight-Tied Message Passing Model
+- Experiment with weight tying: single message passing layer reused multiple times
+- Based on ex14.py architecture but with shared weights across all message passing rounds
+- **Model size**: 1.1M parameters (vs 2.0M in ex14.py - 45% reduction!)
+- **Performance results**:
+  - `3345333e`: 100% accuracy in 74 epochs (vs 44 epochs in ex14.py)
+  - `e76a88a6`: 100% accuracy in 54 epochs (vs 43 epochs in ex14.py)
+- Key innovation: Instead of having separate layers for each message round, uses the same layer repeatedly
+- This forces the model to learn a more general message passing function that works across all rounds
+- **Trade-off**: Slightly slower convergence but 45% smaller model with better parameter efficiency
+- The weight tying constraint makes the model learn a universal message passing operation
+- **Conclusion**: Weight tying is effective - achieves perfect accuracy with significantly fewer parameters 

@@ -59,16 +59,11 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Track validation metrics across entire epoch
         self.validation_outputs = []
 
-        # Example-specific transformation (key for memorization)
-        self.example_embeddings = nn.Parameter(
-            torch.randn(num_train_examples, hidden_dim) * 0.1
-        )
-
         # Feature extraction with layer normalization
         self.feature_extractor = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
@@ -76,13 +71,9 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Position embeddings (learnable for fast adaptation)
         self.pos_embedding = nn.Parameter(torch.randn(30, 30, hidden_dim) * 0.02)
 
-        # Efficient message passing
-        self.message_layers = nn.ModuleList(
-            [
-                SpatialMessagePassing(hidden_dim, dropout=dropout)
-                for _ in range(num_message_rounds)
-            ]
-        )
+        # Efficient message passing with weight tying
+        # Use a single shared layer that gets called multiple times
+        self.shared_message_layer = SpatialMessagePassing(hidden_dim, dropout=dropout)
 
         # Color-specific prediction heads for better specialization
         self.color_heads = nn.ModuleList(
@@ -119,18 +110,13 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Extract base features
         h = self.feature_extractor(features)  # [B, 30, 30, hidden_dim]
 
-        # Add example-specific modulation if available
-        # if example_idx is not None and self.training:
-        #     # Use example embeddings to modulate features
-        #     example_embeds = self.example_embeddings[example_idx]  # [B, hidden_dim]
-        #     h = h + example_embeds.unsqueeze(1).unsqueeze(2)
-
         # Add position embeddings
         h = h + self.pos_embedding.unsqueeze(0)
 
         # Spatial message passing with stronger residuals
-        for i, message_layer in enumerate(self.message_layers):
-            h_new = message_layer(h)
+        # Use the same shared layer multiple times
+        for i in range(self.num_message_rounds):
+            h_new = self.shared_message_layer(h)
             # Gradually increase residual strength
             alpha = 0.3 + 0.1 * (i / self.num_message_rounds)
             h = h + alpha * h_new
@@ -200,10 +186,6 @@ class OptimizedMemorizationModel(pl.LightningModule):
 
         # Combined loss with focus on harder examples
         loss = input_loss + output_loss
-
-        # Add L2 regularization on example embeddings to prevent overfitting
-        reg_loss = 0.001 * self.example_embeddings.pow(2).mean()
-        loss = loss + reg_loss
 
         # Calculate accuracy
         all_logits = torch.cat(
@@ -388,12 +370,10 @@ class OptimizedMemorizationModel(pl.LightningModule):
 
     def configure_optimizers(self) -> Dict[str, Any]:
         # Use SGD with momentum for faster convergence on small dataset
-        optimizer = torch.optim.SGD(
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.lr,
-            momentum=0.95,
             weight_decay=self.weight_decay,
-            nesterov=True,
         )
 
         # Very aggressive learning rate schedule
