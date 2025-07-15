@@ -549,6 +549,64 @@ def load_data_from_directory(
     )
 
 
+def compute_filename_color_mapping(
+    filenames: List[str],
+    inputs_array: NDArray[np.int32],
+) -> Tuple[NDArray[np.str_], NDArray[np.uint8]]:
+    """
+    Computes a mapping from unique filenames to the set of colors used across all their examples.
+
+    Args:
+        filenames: List of filenames for each example
+        inputs_array: numpy array of shape (n_examples, 30, 30) with color values
+
+    Returns:
+        filename_colors_keys: numpy array of unique filenames
+        filename_colors_values: numpy array of shape (n_unique_filenames, 10) with binary values
+                               indicating which colors are used by each filename
+    """
+    from collections import defaultdict
+
+    # Build mapping from filename to set of colors used
+    filename_to_colors: Dict[str, Set[int]] = defaultdict(set)
+
+    for fname, input_grid in zip(filenames, inputs_array):
+        # Get all colors in this example (excluding mask -1)
+        colors_in_example = set(input_grid.flatten())
+        colors_in_example.discard(-1)  # Remove mask
+
+        # Add to the filename's color set
+        filename_to_colors[fname].update(colors_in_example)
+
+    # Convert to sorted arrays for consistent ordering
+    unique_filenames = sorted(filename_to_colors.keys())
+
+    # Create binary matrix indicating which colors each filename uses
+    n_filenames = len(unique_filenames)
+    filename_colors_values = np.zeros((n_filenames, 10), dtype=np.uint8)
+
+    for i, fname in enumerate(unique_filenames):
+        colors = filename_to_colors[fname]
+        for color in colors:
+            if 0 <= color <= 9:  # Ensure valid color range
+                filename_colors_values[i, color] = 1
+
+    filename_colors_keys = np.array(unique_filenames, dtype=np.str_)
+
+    # Print some statistics
+    print(f"\nFilename color mapping statistics:")
+    print(f"  Total unique filenames: {n_filenames}")
+
+    # Count how many colors each filename uses
+    colors_per_file = filename_colors_values.sum(axis=1)
+    for n_colors in range(1, 11):
+        count = (colors_per_file == n_colors).sum()
+        if count > 0:
+            print(f"  Files using {n_colors} colors: {count}")
+
+    return filename_colors_keys, filename_colors_values
+
+
 def save_data_to_npz(
     directory: str,
     output_path: str,
@@ -616,12 +674,19 @@ def save_data_to_npz(
     print(f"Inputs shape: {inputs_array.shape}, dtype: {inputs_array.dtype}")
     print(f"Outputs shape: {outputs_array.shape}, dtype: {outputs_array.dtype}")
 
+    # Compute filename to color mapping
+    filename_colors_keys, filename_colors_values = compute_filename_color_mapping(
+        filenames, inputs_array
+    )
+
     # Prepare data to save
     save_data = {
         "inputs": inputs_array,
         "outputs": outputs_array,
         "filenames": np.array(filenames),
         "indices": np.array(indices, dtype=np.int32),
+        "filename_colors_keys": filename_colors_keys,
+        "filename_colors_values": filename_colors_values,
     }
 
     # Concatenate all features into single tensors
@@ -690,27 +755,8 @@ def save_data_to_npz(
     else:
         print("No features enabled")
 
-    # Save as NPZ file
-    if inputs_features is not None and outputs_features is not None:
-        np.savez_compressed(
-            output_path,
-            inputs=inputs_array,
-            outputs=outputs_array,
-            filenames=np.array(filenames),
-            indices=np.array(indices, dtype=np.int32),
-            inputs_features=inputs_features,
-            outputs_features=outputs_features,
-            feature_names=np.array(feature_names, dtype="U32"),
-        )
-    else:
-        np.savez_compressed(
-            output_path,
-            inputs=inputs_array,
-            outputs=outputs_array,
-            filenames=np.array(filenames),
-            indices=np.array(indices, dtype=np.int32),
-        )
-
+    # Save as NPZ file with all data
+    np.savez_compressed(output_path, **save_data)  # type: ignore
     print(f"Data saved to {output_path}")
 
 
@@ -764,7 +810,21 @@ if __name__ == "__main__":
         help="Compute number of cells matching center cell color (adds 1-feature arrays)",
         default=False,
     )
+    parser.add_argument(
+        "--feature_all",
+        action="store_true",
+        help="Compute all available features (equivalent to enabling all feature flags)",
+        default=False,
+    )
     args = parser.parse_args()
+
+    # If feature_all is enabled, turn on all individual features
+    if args.feature_all:
+        args.feature_order2 = True
+        args.feature_order3 = True
+        args.feature_ncolors = True
+        args.feature_is_mask = True
+        args.feature_ncells_matching_center = True
 
     # Create paths
     data_dir: Path = Path(args.data_dir)
@@ -779,18 +839,21 @@ if __name__ == "__main__":
 
     # Create output filenames based on which features are requested
     suffix = ""
-    if args.feature_order2:
-        suffix += "_order2"
-    if args.feature_order3:
-        suffix += "_order3"
-    if args.feature_ncolors:
-        suffix += "_ncolors"
-    if args.feature_is_mask:
-        suffix += "_is_mask"
-    if args.feature_ncells_matching_center:
-        suffix += "_ncells_matching_center"
-    if suffix == "":
-        suffix = ""  # No features requested, use default names
+    if args.feature_all:
+        suffix = "_all"
+    else:
+        if args.feature_order2:
+            suffix += "_order2"
+        if args.feature_order3:
+            suffix += "_order3"
+        if args.feature_ncolors:
+            suffix += "_ncolors"
+        if args.feature_is_mask:
+            suffix += "_is_mask"
+        if args.feature_ncells_matching_center:
+            suffix += "_ncells_matching_center"
+        if suffix == "":
+            suffix = ""  # No features requested, use default names
 
     train_output: str = str(output_dir / f"train{suffix}.npz")
     eval_output: str = str(output_dir / f"eval{suffix}.npz")

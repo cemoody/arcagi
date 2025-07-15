@@ -1,0 +1,76 @@
+GPU available: True (mps), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+
+  | Name               | Type                     | Params | Mode 
+------------------------------------------------------------------------
+0 | edge_encoder       | EdgeFeatureEncoder       | 27.4 K | train
+1 | filename_embedding | Embedding                | 12.8 K | train
+2 | initial_beliefs    | InitialBeliefNetwork     | 1.1 M  | train
+3 | message_passing    | ConstraintMessagePassing | 6.2 K  | train
+4 | global_consistency | GlobalConsistencyModule  | 3.4 K  | train
+------------------------------------------------------------------------
+1.2 M     Trainable params
+0         Non-trainable params
+1.2 M     Total params
+4.646     Total estimated model params size (MB)
+35        Modules in train mode
+0         Modules in eval mode
+Loading data from ../../processed_data/train_all.npz
+Loaded 1302 examples from 400 unique files
+Feature shape: (1302, 30, 30, 147), Colors shape: (1302, 30, 30)
+Loading data from ../../processed_data/eval_all.npz
+Loaded 419 examples from 400 unique files
+Feature shape: (419, 30, 30, 147), Colors shape: (419, 30, 30)
+Total unique filenames: 400
+Total parameters: 1,161,535
+Sanity Checking: |          | 0/? [00:00<?, ?it/s]Sanity Checking:   0%|          | 0/2 [00:00<?, ?it/s]Sanity Checking DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/Users/chris/code/arcagi/arcagi/color_mapping/ex07.py", line 741, in <module>
+    main()
+  File "/Users/chris/code/arcagi/arcagi/color_mapping/ex07.py", line 733, in main
+    trainer.fit(model, train_loader, val_loader)
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 561, in fit
+    call._call_and_handle_interrupt(
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/call.py", line 48, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 599, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 1012, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 1054, in _run_stage
+    self._run_sanity_check()
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 1083, in _run_sanity_check
+    val_loop.run()
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/loops/utilities.py", line 179, in _decorator
+    return loop_run(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 145, in run
+    self._evaluation_step(batch, batch_idx, dataloader_idx, dataloader_iter)
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 437, in _evaluation_step
+    output = call._call_strategy_hook(trainer, hook_name, *step_args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/call.py", line 328, in _call_strategy_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/pytorch_lightning/strategies/strategy.py", line 412, in validation_step
+    return self.lightning_module.validation_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/arcagi/color_mapping/ex07.py", line 532, in validation_step
+    output = self(features, filename_ids, teacher_colors=None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/arcagi/color_mapping/ex07.py", line 399, in forward
+    edge_features = self.extract_edge_features(features)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chris/code/arcagi/arcagi/color_mapping/ex07.py", line 369, in extract_edge_features
+    features_pad = F.pad(
+                   ^^^^^
+AttributeError: 'int' object has no attribute 'pad'
+                                                                   
