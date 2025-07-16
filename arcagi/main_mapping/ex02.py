@@ -73,8 +73,10 @@ class FeatureMappingModel(pl.LightningModule):
             nn.Dropout(dropout),
         )
 
-        # Position embeddings
-        self.pos_embed = nn.Parameter(torch.randn(30, 30, hidden_dim) * 0.02)
+        # Static position embeddings - separate embeddings for x and y coordinates
+        # Each embedding is half the hidden dimension so when concatenated they equal hidden_dim
+        self.x_pos_embed = nn.Embedding(30, hidden_dim // 2)
+        self.y_pos_embed = nn.Embedding(30, hidden_dim // 2)
 
         # Weight-tied message passing
         self.shared_message_layer = SpatialMessagePassing(hidden_dim, dropout)
@@ -123,7 +125,7 @@ class FeatureMappingModel(pl.LightningModule):
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
+            if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.ones_(module.weight)
@@ -143,8 +145,26 @@ class FeatureMappingModel(pl.LightningModule):
         # Extract base features
         h = self.feature_extractor(features)  # [B, 30, 30, hidden_dim]
 
+        # Create 2D position embeddings by concatenating x and y embeddings
+        batch_size = features.shape[0]
+
+        # Create coordinate grids
+        x_coords = (
+            torch.arange(30, device=features.device).unsqueeze(0).expand(30, -1)
+        )  # [30, 30]
+        y_coords = (
+            torch.arange(30, device=features.device).unsqueeze(1).expand(-1, 30)
+        )  # [30, 30]
+
+        # Get embeddings for each coordinate
+        x_embed = self.x_pos_embed(x_coords)  # [30, 30, hidden_dim//2]
+        y_embed = self.y_pos_embed(y_coords)  # [30, 30, hidden_dim//2]
+
+        # Concatenate to form 2D position embeddings
+        pos_embed_2d = torch.cat([x_embed, y_embed], dim=-1)  # [30, 30, hidden_dim]
+
         # Add position embeddings
-        h = h + self.pos_embed.unsqueeze(0)
+        h = h + pos_embed_2d.unsqueeze(0)
 
         # Spatial message passing with residual connections
         for i in range(self.num_message_rounds):

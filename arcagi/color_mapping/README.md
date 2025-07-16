@@ -4,6 +4,47 @@ This directory contains experiments for learning color mappings from ARC-AGI dat
 
 ## Experiments
 
+### ex16.py - Optimized Memorization with Sinusoidal Position Embeddings
+- Same architecture as ex15.py but with parameter-free position encodings
+- **Sinusoidal Position Embeddings**: Uses Transformer-style sinusoidal encoding:
+  - No learnable parameters for positions (saves 460,800 parameters)
+  - Applies sin/cos functions with different frequencies to x and y coordinates
+  - First half of dimensions encode x-position, second half encode y-position
+- **Binary Noise Regularization**: Adds training-time noise for robustness:
+  - 5% probability of flipping binary features (0↔1) during training
+  - Small Gaussian noise (σ=0.01) for continuous features
+  - Only active during training, disabled during evaluation
+  - Controllable via `--noise_prob` argument (default: 0.05)
+- **Per-Index Accuracy Tracking**: Detailed performance monitoring:
+  - Tracks accuracy separately for each example index within files
+  - Shows input vs output accuracy for each index
+  - Reports whether both input and output achieve perfect accuracy
+  - Helps identify which specific examples are challenging
+- **Colored Terminal Visualization**: Uses `terminal_imshow` for better readability:
+  - Color-coded grid display instead of plain numbers
+  - Shows background (-1) as empty spaces
+  - Includes colored legend for easy interpretation
+  - Much easier to spot differences between predicted and ground truth
+- **Single-File Mode**: Train/test split within same file:
+  - Train on 'train' subset, evaluate on 'test' subset
+  - Useful for understanding generalization within file patterns
+  - Separate test evaluation with detailed metrics
+- Benefits:
+  - Reduces overfitting by removing learnable position parameters
+  - Provides smooth interpolation between positions
+  - Should generalize better to unseen spatial patterns
+  - More robust training with noise regularization
+  - Better visibility into model performance per example
+- **Results**: Near-perfect input accuracy (~99.7%) 
+  - Sinusoidal embeddings may cause less stable training compared to learned embeddings
+  - While parameter-free, they may not adapt as well to spatial patterns in this task
+
+**Training Progress on `28e73c20` (single-file mode, 100 epochs):**
+- **Input accuracy**: ~99.7% - Model learns input patterns very well
+- **Training behavior**: Unstable, oscillates between predicting all zeros or all threes
+- **Parameter reduction**: ~460k fewer parameters compared to ex15.py (learned embeddings)
+- **Key insight**: Sinusoidal embeddings, while parameter-free and theoretically better for generalization, may not be optimal for this specific memorization task where learned position embeddings can better adapt to the spatial patterns in the training data
+
 ### ex01.py - Basic Color Mapping
 - Simple linear model to predict colors from features
 - Achieved 37% validation accuracy with 10 classes
@@ -132,4 +173,35 @@ For perfect memorization on single file:
 - This forces the model to learn a more general message passing function that works across all rounds
 - **Trade-off**: Slightly slower convergence but 45% smaller model with better parameter efficiency
 - The weight tying constraint makes the model learn a universal message passing operation
-- **Conclusion**: Weight tying is effective - achieves perfect accuracy with significantly fewer parameters 
+- **Conclusion**: Weight tying is effective - achieves perfect accuracy with significantly fewer parameters
+
+### ex17.py - Dual Prediction: Colors and Masks
+- **Dual prediction heads**: Predicts both colors and masks (is_mask field) simultaneously
+- **Separate losses and accuracies**: 
+  - Color loss: Cross-entropy for 10-class color classification
+  - Mask loss: Binary cross-entropy for mask prediction
+  - Tracks separate accuracies for color and mask predictions
+- **Enhanced metrics tracking**:
+  - Input/Output color accuracy
+  - Input/Output mask accuracy  
+  - Overall color and mask accuracy
+  - Per-index breakdown for both color and mask performance
+- **Architecture**: Based on ex16.py with additional mask prediction head
+  - Same sinusoidal position embeddings and message passing architecture
+  - Added `mask_head` Linear layer for binary mask prediction
+  - Combined loss: `total_loss = color_loss + mask_loss`
+- **Data loading**: Utilizes `inputs_mask` and `outputs_mask` from processed data
+- **Model outputs**: Returns tuple `(color_logits, mask_logits)` from forward pass
+- **Results on `28e73c20` (6 examples, 200 epochs)**:
+  - **Perfect dual prediction**: 100% accuracy for both colors AND masks
+  - **Training completion**: Achieved perfect accuracy and maintained for 77 consecutive epochs (stopped after 200 total epochs)
+  - **Per-component accuracy**:
+    - Input color accuracy: 100.00% (918 pixels)
+    - Output color accuracy: 100.00% (918 pixels) 
+    - Input mask accuracy: 100.00% (5,400 pixels)
+    - Output mask accuracy: 100.00% (5,400 pixels)
+  - **Per-index performance**: All 6 examples achieved 100% accuracy on both colors and masks
+  - **Best checkpoint**: Epoch 43 with color_acc=1.0000, mask_acc=0.9965
+  - **Final validation loss**: 2.9e-6 (extremely low, indicating perfect memorization)
+- **Key achievement**: First model to successfully predict both color classification and binary mask with perfect accuracy
+- **Robustness**: Maintained perfect accuracy across all validation examples and both prediction tasks 

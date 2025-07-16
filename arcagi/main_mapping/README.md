@@ -48,6 +48,36 @@ The 147-dimensional feature vector consists of:
   - Mask prediction accuracy tracking
   - **Filename filtering**: Can train on examples from a single file (default: `28e73c20`)
 
+### ex03.py - Sinusoidal Position Embeddings
+- Same architecture as ex01.py but with parameter-free position encodings
+- **Sinusoidal Position Embeddings**: Uses the Transformer-style sinusoidal encoding:
+  - No learnable parameters for positions (completely parameter-free)
+  - Applies sin/cos functions with different frequencies to x and y coordinates
+  - First half of dimensions encode x-position, second half encode y-position
+  - Uses the formula: PE(pos, 2i) = sin(pos/10000^(2i/d)), PE(pos, 2i+1) = cos(pos/10000^(2i/d))
+- Benefits:
+  - Zero position-related parameters (down from 460,800 in ex01.py)
+  - Smooth interpolation between positions
+  - Can theoretically generalize to unseen positions
+  - Proven effective in Transformers and other architectures
+
+## Model Conclusions
+
+### ex01.py Results
+- **Overfitting on Training Set**: The model effectively overfits on the 5 training examples, achieving near-perfect accuracy
+- **Test Set Performance**: On the test example, the model almost gets it perfect initially
+- **Performance Degradation**: However, after a few epochs, test performance actually degrades
+- **Suspected Cause**: The position embeddings (one for every cell in the 30×30 grid) are likely leading to overfitting
+- **Next Steps**: The next experiment will remove or replace the position embeddings with a more generalizable approach
+
+
+## ex03.py Results
+- Works pretty well, even without pos embeddings
+- However, I notice that the *expected* color image is itself pretty sloppy. Is the color mapping really perfect for the eval set?
+- Also for 28e73c20 i am noticing that the outer color should have been 3, but in our validation data we see 0. 
+
+
+
 ## Running Experiments
 
 To run the first experiment:

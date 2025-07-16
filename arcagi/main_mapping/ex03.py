@@ -73,8 +73,11 @@ class FeatureMappingModel(pl.LightningModule):
             nn.Dropout(dropout),
         )
 
-        # Position embeddings
-        self.pos_embed = nn.Parameter(torch.randn(30, 30, hidden_dim) * 0.02)
+        # Sinusoidal position embeddings - no parameters needed
+        # Pre-compute the position embeddings for efficiency
+        self.register_buffer(
+            "pos_embed", self._create_sinusoidal_embeddings(hidden_dim)
+        )
 
         # Weight-tied message passing
         self.shared_message_layer = SpatialMessagePassing(hidden_dim, dropout)
@@ -120,10 +123,47 @@ class FeatureMappingModel(pl.LightningModule):
         """Set the checkpoint directory for loading color models."""
         self.color_model_checkpoint_dir = checkpoint_dir
 
+    def _create_sinusoidal_embeddings(self, hidden_dim: int) -> torch.Tensor:
+        """Create sinusoidal position embeddings for a 30x30 grid."""
+        import math
+
+        # Create position indices for x and y
+        x_pos = torch.arange(30).float()
+        y_pos = torch.arange(30).float()
+
+        # Create 2D grid of positions
+        grid_x, grid_y = torch.meshgrid(x_pos, y_pos, indexing="ij")
+
+        # Initialize embedding tensor
+        pos_embed = torch.zeros(30, 30, hidden_dim)
+
+        # Half dimensions for x, half for y
+        half_dim = hidden_dim // 2
+
+        # Create div_term for frequency scaling
+        div_term_x = torch.exp(
+            torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
+        )
+        div_term_y = torch.exp(
+            torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
+        )
+
+        # Apply sinusoidal functions to x coordinates
+        pos_embed[:, :, 0:half_dim:2] = torch.sin(grid_x.unsqueeze(-1) * div_term_x)
+        pos_embed[:, :, 1:half_dim:2] = torch.cos(grid_x.unsqueeze(-1) * div_term_x)
+
+        # Apply sinusoidal functions to y coordinates
+        pos_embed[:, :, half_dim::2] = torch.sin(grid_y.unsqueeze(-1) * div_term_y)
+        pos_embed[:, :, half_dim + 1 :: 2] = torch.cos(
+            grid_y.unsqueeze(-1) * div_term_y
+        )
+
+        return pos_embed
+
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
+            if hasattr(module, "bias") and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.ones_(module.weight)
@@ -143,7 +183,8 @@ class FeatureMappingModel(pl.LightningModule):
         # Extract base features
         h = self.feature_extractor(features)  # [B, 30, 30, hidden_dim]
 
-        # Add position embeddings
+        # Add pre-computed sinusoidal position embeddings
+        # pos_embed is already [30, 30, hidden_dim], just need to add batch dimension
         h = h + self.pos_embed.unsqueeze(0)
 
         # Spatial message passing with residual connections
