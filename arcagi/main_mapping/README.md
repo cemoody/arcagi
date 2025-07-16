@@ -29,6 +29,53 @@ The 147-dimensional feature vector consists of:
 
 ## Experiments
 
+### ex05.py - Message Passing Feature Mapper with Training Noise & BCE Loss (Latest)
+- Enhanced version of ex04.py with binary noise injection and proper binary loss functions
+- **Binary Cross Entropy Loss**: Uses BCE loss instead of MSE for all binary features
+  - More appropriate for binary classification tasks (0/1 features)
+  - Better gradients and training dynamics for binary data
+  - Applied to both order2 features (heavily weighted) and other features
+  - Uses `binary_cross_entropy_with_logits` for numerical stability
+- **Training Noise**: Adds controlled binary noise to input features during training only
+  - Default `noise_prob=0.05` (5% chance to flip each binary feature value)
+  - Only applied during training, not validation/inference
+  - Configurable via `--noise_prob` command line argument
+  - For binary features: flips 0→1 and 1→0 with specified probability
+- **Robustness Benefits**:
+  - Helps prevent overfitting to exact feature patterns
+  - Improves generalization to slightly corrupted inputs
+  - Forces the model to learn more robust feature representations
+  - Particularly useful for small datasets where overfitting is common
+- **Architecture**: Same message passing with sinusoidal position embeddings and 48 message rounds
+- **Integration**: Includes ex17 color model integration for enhanced visualization
+- **Accuracy Calculation**: Apply sigmoid to model logits, then threshold at 0.5 for binary predictions
+
+### ex05.py Results & Findings
+- **Severe Overfitting**: Achieves 100% training accuracy with near-zero loss (1.12e-6) by epoch 14
+- **Poor Generalization**: Test accuracy only 86.11% despite perfect training performance
+- **Key Issues Identified**:
+  1. **48 Message Rounds**: Doubled from ex04's 24 rounds, providing too much capacity
+  2. **BCE Loss Convergence**: BCE converges much faster than MSE for binary features
+  3. **Small Dataset**: Training on just 5 examples from one file (28e73c20) makes memorization easy
+- **Overfitting Mechanism**: 
+  - With 48 rounds, information can traverse the entire 30x30 grid multiple times
+  - Combined with BCE's efficient gradients, the model quickly memorizes training examples
+  - The deeper computation graph (48 layers of message passing) enables learning complex, example-specific patterns
+- **Lessons Learned**:
+  - More message rounds can hurt generalization even without adding parameters
+  - BCE loss requires more regularization than MSE for binary features
+  - Need to balance global information propagation with generalization ability
+
+### Potential Solutions for ex05 Overfitting
+To maintain global information propagation while reducing overfitting:
+1. **Stochastic Message Passing**: Randomly vary number of rounds during training (e.g., 12-48)
+2. **Message Dropout**: Skip random message passing rounds during training
+3. **Progressive Training**: Start with fewer rounds, gradually increase during training
+4. **DropPath/Stochastic Depth**: Skip rounds with increasing probability
+5. **Reduce Message Rounds**: Simply use fewer rounds (e.g., back to 24 or even 12-16)
+6. **Add Regularization**: Increase dropout, weight decay, or noise probability
+7. **Early Stopping**: Stop training based on validation loss instead of continuing to overfit
+
 ### ex01.py - Message Passing Feature Mapper
 - Based on the successful ex15.py architecture from color_mapping
 - Uses weight-tied message passing (single layer reused 12 times)
@@ -74,13 +121,54 @@ The 147-dimensional feature vector consists of:
 ## ex03.py Results
 - Works pretty well, even without pos embeddings
 - However, I notice that the *expected* color image is itself pretty sloppy. Is the color mapping really perfect for the eval set?
-- Also for 28e73c20 i am noticing that the outer color should have been 3, but in our validation data we see 0. 
+- Also for 28e73c20 i am noticing that the outer color should have been 3, but in our validation data we see 0.
+
+### ex04.py - Enhanced Message Passing with ex17 Color Models
+- Updated version of ex03.py using ex17 dual prediction color models for visualization
+- **Architecture**: Same message passing with sinusoidal position embeddings but with 24 message rounds (doubled from 12)
+- **Key Features**:
+  - Integration with ex17 color models for enhanced visualization
+  - Dual prediction capability (colors + masks) from loaded models
+  - Accuracy metrics calculation for both colors and masks after visualization
+  - Updated checkpoint directory support for ex17 models
+- **Visualization Enhancements**:
+  - Uses ex17 trained models for color prediction from features
+  - Shows both expected and predicted outputs with color visualization
+  - Displays accuracy metrics after each validation example
+  - Backward compatible with ex15 model interface
+- **Results on `28e73c20` (Single-file mode, 29 epochs before interruption)**:
+  - **Training Performance**: 100% order2 accuracy on all 5 training examples
+  - **Validation Performance**: 
+    - Test Example 5: 97-99% color accuracy within predicted regions
+    - Mask accuracy: 100% (perfect mask prediction)
+    - Order2 accuracy: 99.6-99.7% 
+  - **Progressive Improvement**: Color accuracy improved from 97.22% to 98.15% over epochs
+  - **Training Stability**: Consistent 100% training accuracy with decreasing loss (0.03-0.09)
+  - **Visualization Quality**: Clear color-coded terminal output showing expected vs predicted patterns
+- **Model Integration Success**: Successfully loads and uses ex17 dual-prediction models for inference
+- **Enhanced Metrics**: Now shows separate accuracy for colors within predicted mask regions vs target mask regions 
 
 
 
 ## Running Experiments
 
-To run the first experiment:
+To run the latest experiment (ex05.py):
+
+```bash
+# Train with default 5% noise
+python arcagi/main_mapping/ex05.py --filename 28e73c20
+
+# Train with custom noise level
+python arcagi/main_mapping/ex05.py --filename 28e73c20 --noise_prob 0.1  # 10% noise
+
+# Train without noise
+python arcagi/main_mapping/ex05.py --filename 28e73c20 --noise_prob 0.0
+
+# Train on all files with noise
+python arcagi/main_mapping/ex05.py --filename all --noise_prob 0.05
+```
+
+To run earlier experiments:
 
 ```bash
 # Train on all files
@@ -121,6 +209,47 @@ Wandb will log:
 - **val_epoch_order2_acc**: Accuracy on order2 features (primary metric)
 - **val_epoch_mask_acc**: Accuracy on mask prediction
 - **val_epoch_loss**: Total validation loss
+
+## Binary Cross Entropy Loss (ex05.py)
+
+Since all features in the ARC-AGI dataset are binary (0 or 1), ex05.py uses Binary Cross Entropy (BCE) loss instead of Mean Squared Error (MSE):
+
+1. **Why BCE over MSE**:
+   - MSE treats the problem as regression, but our features are discrete binary values
+   - BCE is specifically designed for binary classification/prediction tasks
+   - Provides better gradients: steeper gradients when predictions are wrong, gentler when close
+   - More stable training for binary targets
+
+2. **Implementation Details**:
+   - Uses `F.binary_cross_entropy_with_logits()` for numerical stability
+   - **Model Architecture**: Feature head ends with raw `Linear` layer (no activation)
+   - **Perfect Logits**: Model outputs are unbounded (-∞ to +∞), ideal for BCE loss
+   - Applied to both order2 features (36 dims) and other features (111 dims)
+   - **Accuracy Calculation**: Apply sigmoid to logits, then threshold at 0.5
+   - Order2 features still weighted 10x higher in the total loss
+
+3. **Accuracy Calculation**:
+   - Applies `torch.sigmoid()` to logits to get probabilities
+   - Thresholds at 0.5 to get binary predictions
+   - Compares binary predictions with binary targets
+
+## Training Noise Mechanism (ex05.py)
+
+The training noise feature adds robustness by randomly flipping binary feature values during training:
+
+1. **When Applied**: Only during training phase (`model.training=True`), never during validation/inference
+2. **How It Works**: 
+   - For each input feature value, generate a random number between 0 and 1
+   - If the random number < `noise_prob`, flip the feature value (0→1, 1→0)
+   - Otherwise, keep the original value unchanged
+3. **Benefits**:
+   - **Prevents Overfitting**: Forces the model to be robust to small perturbations
+   - **Improves Generalization**: Model learns to handle slightly corrupted inputs
+   - **Better Feature Learning**: Model must rely on combinations of features rather than exact patterns
+4. **Implementation Details**:
+   - Uses `torch.rand_like()` for efficient vectorized noise generation
+   - Creates a copy of input features to avoid modifying original data
+   - Configurable probability parameter with sensible default (5%)
 
 ## Data Requirements
 
