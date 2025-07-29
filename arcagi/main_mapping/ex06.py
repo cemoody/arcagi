@@ -318,18 +318,59 @@ class FeatureMappingModel(pl.LightningModule):
                         total = outputs_mask[i].sum() * 36
                         accuracy = correct / total if total > 0 else 0.0
 
+                        # Calculate mask accuracy for this example
+                        pred_mask_single = (pred_mask_logits[i].squeeze(-1) > 0).float()
+                        mask_correct = (
+                            pred_mask_single == outputs_mask[i].float()
+                        ).sum()
+                        mask_total = torch.numel(outputs_mask[i])
+                        mask_incorrect = mask_total - mask_correct
+                        mask_accuracy = (
+                            mask_correct / mask_total if mask_total > 0 else 0.0
+                        )
+
+                        # For color accuracy, we need the target colors which aren't directly available
+                        # in the training step. For now, we'll set this to 0.0 and implement
+                        # proper color accuracy calculation in a separate validation method.
+                        color_accuracy = 0.0
+                        color_incorrect = 0.0  # Placeholder for color incorrect count
+
                         # Store metrics
                         if idx not in self.training_example_metrics:
                             self.training_example_metrics[idx] = {
                                 "count": 0,
                                 "loss_sum": 0.0,
                                 "acc_sum": 0.0,
+                                "mask_acc_sum": 0.0,
+                                "color_acc_sum": 0.0,
+                                "mask_incorrect_sum": 0.0,
+                                "color_incorrect_sum": 0.0,
                             }
 
                         self.training_example_metrics[idx]["count"] += 1
                         self.training_example_metrics[idx]["loss_sum"] += loss.item()
                         self.training_example_metrics[idx]["acc_sum"] += (
                             accuracy.item() if torch.is_tensor(accuracy) else accuracy
+                        )
+                        self.training_example_metrics[idx]["mask_acc_sum"] += (
+                            mask_accuracy.item()
+                            if torch.is_tensor(mask_accuracy)
+                            else mask_accuracy
+                        )
+                        self.training_example_metrics[idx]["color_acc_sum"] += (
+                            color_accuracy.item()
+                            if torch.is_tensor(color_accuracy)
+                            else color_accuracy
+                        )
+                        self.training_example_metrics[idx]["mask_incorrect_sum"] += (
+                            mask_incorrect.item()
+                            if torch.is_tensor(mask_incorrect)
+                            else mask_incorrect
+                        )
+                        self.training_example_metrics[idx]["color_incorrect_sum"] += (
+                            color_incorrect.item()
+                            if torch.is_tensor(color_incorrect)
+                            else color_incorrect
                         )
 
         # Log metrics
@@ -459,9 +500,9 @@ class FeatureMappingModel(pl.LightningModule):
                 )
                 print("(Note: These are averaged across all augmented copies)")
                 print(
-                    f"{'Example':<10} {'Seen':<10} {'Avg Loss':<15} {'Avg Order2 Acc':<20}"
+                    f"{'Example':<10} {'Seen':<10} {'Avg Loss':<15} {'Avg Order2 Acc':<20} {'Avg Mask Acc':<15} {'Avg Color Acc':<15} {'Mask Incorrect':<15} {'Color Incorrect':<15}"
                 )
-                print("-" * 60)
+                print("-" * 125)
 
                 for idx in unique_indices:
                     if idx in self.training_example_metrics:
@@ -469,8 +510,12 @@ class FeatureMappingModel(pl.LightningModule):
                         count = metrics["count"]
                         avg_loss = metrics["loss_sum"] / count
                         avg_acc = metrics["acc_sum"] / count
+                        avg_mask_acc = metrics["mask_acc_sum"] / count
+                        avg_color_acc = metrics["color_acc_sum"] / count
+                        avg_mask_incorrect = metrics["mask_incorrect_sum"] / count
+                        avg_color_incorrect = metrics["color_incorrect_sum"] / count
                         print(
-                            f"{idx:<10} {count:<10} {avg_loss:<15.3f} {avg_acc:<20.2%}"
+                            f"{idx:<10} {count:<10} {avg_loss:<15.3f} {avg_acc:<20.2%} {avg_mask_acc:<15.2%} {avg_color_acc:<15.2%} {avg_mask_incorrect:<15.1f} {avg_color_incorrect:<15.1f}"
                         )
 
             # Reset for next epoch
@@ -539,7 +584,7 @@ class FeatureMappingModel(pl.LightningModule):
             prog_bar=True,
         )
 
-        # Calculate per-example metrics
+        # Calculate per-example metrics (enhanced to match training metrics)
         per_example_data = []
         for i in range(len(indices)):
             example_idx = indices[i].item()
@@ -558,8 +603,30 @@ class FeatureMappingModel(pl.LightningModule):
                     dim=-1
                 )
                 correct_pixels = (all_features_match * outputs_mask[i]).sum()
+
+                # Calculate order2 accuracy
+                order2_correct = (
+                    (pred_order2_binary_ex == target_order2_ex)
+                    * outputs_mask[i].unsqueeze(-1)
+                ).sum()
+                order2_total = outputs_mask[i].sum() * 36
+                order2_accuracy = (
+                    order2_correct / order2_total if order2_total > 0 else 0.0
+                )
             else:
                 correct_pixels = 0
+                order2_accuracy = 0.0
+
+            # Calculate mask accuracy for this example
+            pred_mask_single = (pred_mask_logits[i].squeeze(-1) > 0).float()
+            mask_correct = (pred_mask_single == outputs_mask[i].float()).sum()
+            mask_total = torch.numel(outputs_mask[i])
+            mask_incorrect = mask_total - mask_correct
+            mask_accuracy = mask_correct / mask_total if mask_total > 0 else 0.0
+
+            # Color accuracy placeholder (same as training)
+            color_accuracy = 0.0
+            color_incorrect = 0.0
 
             per_example_data.append(
                 {
@@ -570,6 +637,23 @@ class FeatureMappingModel(pl.LightningModule):
                         if torch.is_tensor(correct_pixels)
                         else correct_pixels
                     ),
+                    "order2_accuracy": (
+                        order2_accuracy.item()
+                        if torch.is_tensor(order2_accuracy)
+                        else order2_accuracy
+                    ),
+                    "mask_accuracy": (
+                        mask_accuracy.item()
+                        if torch.is_tensor(mask_accuracy)
+                        else mask_accuracy
+                    ),
+                    "color_accuracy": color_accuracy,
+                    "mask_incorrect": (
+                        mask_incorrect.item()
+                        if torch.is_tensor(mask_incorrect)
+                        else mask_incorrect
+                    ),
+                    "color_incorrect": color_incorrect,
                 }
             )
 
@@ -652,12 +736,13 @@ class FeatureMappingModel(pl.LightningModule):
         )
 
         if single_file_mode:
-            # Single file mode: show metrics for each individual example
-            print(f"\nEpoch {self.current_epoch} - Per-Example Metrics:")
+            # Single file mode: show enhanced metrics for each individual example
+            print(f"\nValidation Epoch {self.current_epoch} - Per-Example Performance:")
+            print("(Enhanced metrics matching training format)")
             print(
-                f"{'Example':<10} {'Non-mask Pixels':<20} {'Correct Pixels':<20} {'Accuracy':<10}"
+                f"{'Example':<10} {'Valid Pixels':<15} {'Order2 Acc':<15} {'Mask Acc':<15} {'Color Acc':<15} {'Mask Incorrect':<15} {'Color Incorrect':<15}"
             )
-            print("-" * 70)
+            print("-" * 115)
 
             # Collect metrics for each example in order
             example_metrics = {}
@@ -672,17 +757,26 @@ class FeatureMappingModel(pl.LightningModule):
                 metrics = example_metrics[idx]
                 valid_pixels = metrics["valid_pixels"]
                 correct_pixels = metrics["correct_pixels"]
-                accuracy = correct_pixels / valid_pixels if valid_pixels > 0 else 0.0
+                order2_acc = metrics.get("order2_accuracy", 0.0)
+                mask_acc = metrics.get("mask_accuracy", 0.0)
+                color_acc = metrics.get("color_accuracy", 0.0)
+                mask_incorrect = metrics.get("mask_incorrect", 0.0)
+                color_incorrect = metrics.get("color_incorrect", 0.0)
+
                 print(
-                    f"{idx:<10} {valid_pixels:<20} {correct_pixels:<20.1f} {accuracy:<10.2%}"
+                    f"{idx:<10} {valid_pixels:<15} {order2_acc:<15.2%} {mask_acc:<15.2%} {color_acc:<15.2%} {mask_incorrect:<15.1f} {color_incorrect:<15.1f}"
                 )
 
-                # Log to wandb
+                # Enhanced wandb logging
                 self.log(f"val_example_{idx}_valid_pixels", float(valid_pixels))
                 self.log(f"val_example_{idx}_correct_pixels", float(correct_pixels))
-                self.log(f"val_example_{idx}_accuracy", accuracy)
+                self.log(f"val_example_{idx}_order2_accuracy", float(order2_acc))
+                self.log(f"val_example_{idx}_mask_accuracy", float(mask_acc))
+                self.log(f"val_example_{idx}_color_accuracy", float(color_acc))
+                self.log(f"val_example_{idx}_mask_incorrect", float(mask_incorrect))
+                self.log(f"val_example_{idx}_color_incorrect", float(color_incorrect))
         else:
-            # Multi-file mode: aggregate metrics by index
+            # Multi-file mode: aggregate enhanced metrics by index
             index_metrics = {}
             for output in self.validation_outputs:
                 for example_data in output["per_example_data"]:
@@ -691,6 +785,15 @@ class FeatureMappingModel(pl.LightningModule):
                         index_metrics[idx] = {
                             "valid_pixels_sum": example_data["valid_pixels"],
                             "correct_pixels_sum": example_data["correct_pixels"],
+                            "order2_acc_sum": example_data.get("order2_accuracy", 0.0),
+                            "mask_acc_sum": example_data.get("mask_accuracy", 0.0),
+                            "color_acc_sum": example_data.get("color_accuracy", 0.0),
+                            "mask_incorrect_sum": example_data.get(
+                                "mask_incorrect", 0.0
+                            ),
+                            "color_incorrect_sum": example_data.get(
+                                "color_incorrect", 0.0
+                            ),
                             "count": 1,
                         }
                     else:
@@ -701,43 +804,66 @@ class FeatureMappingModel(pl.LightningModule):
                         index_metrics[idx]["correct_pixels_sum"] += example_data[
                             "correct_pixels"
                         ]
+                        index_metrics[idx]["order2_acc_sum"] += example_data.get(
+                            "order2_accuracy", 0.0
+                        )
+                        index_metrics[idx]["mask_acc_sum"] += example_data.get(
+                            "mask_accuracy", 0.0
+                        )
+                        index_metrics[idx]["color_acc_sum"] += example_data.get(
+                            "color_accuracy", 0.0
+                        )
+                        index_metrics[idx]["mask_incorrect_sum"] += example_data.get(
+                            "mask_incorrect", 0.0
+                        )
+                        index_metrics[idx]["color_incorrect_sum"] += example_data.get(
+                            "color_incorrect", 0.0
+                        )
                         index_metrics[idx]["count"] += 1
 
-            # Report per-index metrics in ascending order
+            # Report enhanced per-index metrics in ascending order
             if index_metrics:
                 print(
-                    f"\nEpoch {self.current_epoch} - Per-Index Metrics (averaged over validation examples):"
+                    f"\nValidation Epoch {self.current_epoch} - Per-Index Performance (averaged):"
                 )
+                print("(Enhanced metrics matching training format)")
                 print(
-                    f"{'Index':<10} {'Count':<10} {'Avg Non-mask Pixels':<25} {'Avg Correct Pixels':<25} {'Accuracy':<10}"
+                    f"{'Index':<10} {'Count':<10} {'Avg Valid Pixels':<18} {'Avg Order2 Acc':<18} {'Avg Mask Acc':<15} {'Avg Color Acc':<15} {'Avg Mask Incorrect':<20} {'Avg Color Incorrect':<20}"
                 )
-                print("-" * 85)
+                print("-" * 140)
 
                 for idx in sorted(index_metrics.keys()):
                     metrics = index_metrics[idx]
                     count = metrics["count"]
                     avg_valid_pixels = metrics["valid_pixels_sum"] / count
                     avg_correct_pixels = metrics["correct_pixels_sum"] / count
-                    accuracy = (
-                        avg_correct_pixels / avg_valid_pixels
-                        if avg_valid_pixels > 0
-                        else 0.0
-                    )
+                    avg_order2_acc = metrics["order2_acc_sum"] / count
+                    avg_mask_acc = metrics["mask_acc_sum"] / count
+                    avg_color_acc = metrics["color_acc_sum"] / count
+                    avg_mask_incorrect = metrics["mask_incorrect_sum"] / count
+                    avg_color_incorrect = metrics["color_incorrect_sum"] / count
+
                     print(
-                        f"{idx:<10} {count:<10} {avg_valid_pixels:<25.1f} {avg_correct_pixels:<25.1f} {accuracy:<10.2%}"
+                        f"{idx:<10} {count:<10} {avg_valid_pixels:<18.1f} {avg_order2_acc:<18.2%} {avg_mask_acc:<15.2%} {avg_color_acc:<15.2%} {avg_mask_incorrect:<20.1f} {avg_color_incorrect:<20.1f}"
                     )
 
-                    # Log to wandb
+                    # Enhanced wandb logging
                     self.log(f"val_idx_{idx}_count", float(count))
                     self.log(f"val_idx_{idx}_avg_valid_pixels", float(avg_valid_pixels))
                     self.log(
                         f"val_idx_{idx}_avg_correct_pixels", float(avg_correct_pixels)
                     )
                     self.log(
-                        f"val_idx_{idx}_total_correct_pixels",
-                        float(metrics["correct_pixels_sum"]),
+                        f"val_idx_{idx}_avg_order2_accuracy", float(avg_order2_acc)
                     )
-                    self.log(f"val_idx_{idx}_accuracy", accuracy)
+                    self.log(f"val_idx_{idx}_avg_mask_accuracy", float(avg_mask_acc))
+                    self.log(f"val_idx_{idx}_avg_color_accuracy", float(avg_color_acc))
+                    self.log(
+                        f"val_idx_{idx}_avg_mask_incorrect", float(avg_mask_incorrect)
+                    )
+                    self.log(
+                        f"val_idx_{idx}_avg_color_incorrect", float(avg_color_incorrect)
+                    )
 
         # Edge visualization for validation examples (test subset only)
         if self.validation_examples_for_viz:
@@ -787,40 +913,24 @@ class FeatureMappingModel(pl.LightningModule):
                         pred_region_binary = (pred_region > 0.5).float()
 
                         try:
-                            print(
-                                f"Expected output (showing region {min_y}:{max_y+1}, {min_x}:{max_x+1}):"
-                            )
+                            print(f"Expected output (full 30x30 image):")
                             if self.current_filename and "target_full" in example:
-                                # Pass full 30x30 features to color model but display the region
+                                # Show full 30x30 features to color model
                                 self.visualize_with_color_model(
                                     example["target_full"],  # Full 30x30 features
                                     self.current_filename,
                                     f"Expected_Ex{example_idx}",
-                                    region_bounds=(
-                                        min_y,
-                                        max_y,
-                                        min_x,
-                                        max_x,
-                                    ),  # Show only this region
                                 )
                             else:
                                 relshow(target_region, title=None)
 
-                            print(
-                                f"Predicted output (showing region {min_y}:{max_y+1}, {min_x}:{max_x+1}):"
-                            )
+                            print(f"Predicted output (full 30x30 image):")
                             if self.current_filename and "predicted_full" in example:
-                                # Pass full 30x30 features to color model but display the region
+                                # Show full 30x30 features to color model
                                 self.visualize_with_color_model(
                                     example["predicted_full"],  # Full 30x30 features
                                     self.current_filename,
                                     f"Predicted_Ex{example_idx}",
-                                    region_bounds=(
-                                        min_y,
-                                        max_y,
-                                        min_x,
-                                        max_x,
-                                    ),  # Show only this region
                                 )
                             else:
                                 relshow(pred_region_binary, title=None)
@@ -1267,16 +1377,7 @@ def main():
         print(f"Evaluating on 'test' subset of {filename_filter}")
 
         # Both loaders use the training data file
-        # Check if augmented file exists, otherwise fall back to non-augmented
-        train_path_aug = os.path.join(args.data_dir, "train_all_d4aug.npz")
-
-        if os.path.exists(train_path_aug):
-            train_path = train_path_aug
-            print("Using D4-augmented data file for single-file mode")
-        else:
-            train_path = os.path.join(args.data_dir, "train_all.npz")
-            print("Using non-augmented data file for single-file mode")
-
+        train_path = os.path.join(args.data_dir, "train_all.npz")
         val_path = train_path  # Same file
 
         # Load training data (train subset only)
@@ -1300,18 +1401,8 @@ def main():
         )
     else:
         # Standard mode: use separate train and eval files
-        # Check if augmented files exist, otherwise fall back to non-augmented
-        train_path_aug = os.path.join(args.data_dir, "train_all_d4aug.npz")
-        val_path_aug = os.path.join(args.data_dir, "eval_all_d4aug.npz")
-
-        if os.path.exists(train_path_aug) and os.path.exists(val_path_aug):
-            train_path = train_path_aug
-            val_path = val_path_aug
-            print("Using D4-augmented data files")
-        else:
-            train_path = os.path.join(args.data_dir, "train_all.npz")
-            val_path = os.path.join(args.data_dir, "eval_all.npz")
-            print("Using non-augmented data files")
+        train_path = os.path.join(args.data_dir, "train_all.npz")
+        val_path = os.path.join(args.data_dir, "eval_all.npz")
 
         train_loader = load_feature_data(
             train_path,

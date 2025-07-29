@@ -36,6 +36,73 @@ def expand_matrix(matrix: List[List[int]]) -> List[List[int]]:
     return new_matrix
 
 
+def apply_d4_transformations(matrix: List[List[int]]) -> List[List[List[int]]]:
+    """
+    Apply all 8 D4 symmetry transformations to a matrix.
+
+    The D4 group consists of:
+    - 4 rotations: 0°, 90°, 180°, 270°
+    - 4 reflections: horizontal flip + above rotations
+
+    Args:
+        matrix: 2D list representing the input matrix
+
+    Returns:
+        List of 8 transformed matrices in the following order:
+        [identity, rot90, rot180, rot270, flip_h, flip_h_rot90, flip_h_rot180, flip_h_rot270]
+    """
+
+    # Helper function to rotate matrix 90 degrees clockwise
+    def rotate_90(mat: List[List[int]]) -> List[List[int]]:
+        h = len(mat)
+        w = len(mat[0]) if h > 0 else 0
+        rotated = [[0 for _ in range(h)] for _ in range(w)]
+        for i in range(h):
+            for j in range(w):
+                rotated[j][h - 1 - i] = mat[i][j]
+        return rotated
+
+    # Helper function to flip matrix horizontally
+    def flip_horizontal(mat: List[List[int]]) -> List[List[int]]:
+        return [row[::-1] for row in mat]
+
+    # Generate all 8 transformations
+    transformations: List[List[List[int]]] = []
+
+    # 1. Identity (no transformation)
+    transformations.append([row[:] for row in matrix])
+
+    # 2. Rotate 90° clockwise
+    rot90 = rotate_90(matrix)
+    transformations.append(rot90)
+
+    # 3. Rotate 180°
+    rot180 = rotate_90(rot90)
+    transformations.append(rot180)
+
+    # 4. Rotate 270° clockwise (or 90° counter-clockwise)
+    rot270 = rotate_90(rot180)
+    transformations.append(rot270)
+
+    # 5. Horizontal flip
+    flip_h = flip_horizontal(matrix)
+    transformations.append(flip_h)
+
+    # 6. Horizontal flip + rotate 90°
+    flip_h_rot90 = rotate_90(flip_h)
+    transformations.append(flip_h_rot90)
+
+    # 7. Horizontal flip + rotate 180°
+    flip_h_rot180 = rotate_90(flip_h_rot90)
+    transformations.append(flip_h_rot180)
+
+    # 8. Horizontal flip + rotate 270°
+    flip_h_rot270 = rotate_90(flip_h_rot180)
+    transformations.append(flip_h_rot270)
+
+    return transformations
+
+
 def compute_order2_features(matrix: NDArray[np.int32]) -> NDArray[np.uint8]:
     """
     Computes order-2 (pairwise) relational features for a 30x30 matrix.
@@ -333,6 +400,7 @@ def load_data_from_directory(
     feature_ncolors: bool = False,
     feature_is_mask: bool = False,
     feature_ncells_matching_center: bool = False,
+    augment_d4_symmetry: bool = False,
 ) -> Tuple[
     List[str],
     List[int],
@@ -363,6 +431,7 @@ def load_data_from_directory(
         feature_ncolors: Whether to compute number of distinct colors in 3x3 neighborhood
         feature_is_mask: Whether to compute binary mask feature (1 if cell is mask, 0 otherwise)
         feature_ncells_matching_center: Whether to compute number of cells matching center cell color
+        augment_d4_symmetry: Whether to apply all 8 D4 symmetry transformations to augment data (8x increase)
 
     Returns:
         filenames: List of filename strings
@@ -399,15 +468,31 @@ def load_data_from_directory(
         if "train" in data:
             examples: List[Dict[str, Any]] = data["train"]
             for idx, example in enumerate(examples):
-                filenames.append(json_file.name)
-                indices.append(idx)
-                subset_example_index_is_train.append(
-                    True
-                )  # This is from "train" subset
                 input_colors: List[List[int]] = example["input"]
                 output_colors: List[List[int]] = example["output"]
-                inputs_expanded.append(expand_matrix(input_colors))
-                outputs_expanded.append(expand_matrix(output_colors))
+
+                if augment_d4_symmetry:
+                    # Apply all 8 D4 transformations
+                    input_transforms = apply_d4_transformations(input_colors)
+                    output_transforms = apply_d4_transformations(output_colors)
+
+                    for transform_idx in range(8):
+                        filenames.append(json_file.name)
+                        indices.append(idx)
+                        subset_example_index_is_train.append(True)
+                        inputs_expanded.append(
+                            expand_matrix(input_transforms[transform_idx])
+                        )
+                        outputs_expanded.append(
+                            expand_matrix(output_transforms[transform_idx])
+                        )
+                else:
+                    # No augmentation, just add the original
+                    filenames.append(json_file.name)
+                    indices.append(idx)
+                    subset_example_index_is_train.append(True)
+                    inputs_expanded.append(expand_matrix(input_colors))
+                    outputs_expanded.append(expand_matrix(output_colors))
 
         # Process "test" subset if it exists
         if "test" in data:
@@ -415,15 +500,31 @@ def load_data_from_directory(
             # Continue numbering from where train left off
             train_count = len(data.get("train", []))
             for idx, example in enumerate(examples):
-                filenames.append(json_file.name)
-                indices.append(train_count + idx)  # Continue index numbering
-                subset_example_index_is_train.append(
-                    False
-                )  # This is from "test" subset
                 input_colors: List[List[int]] = example["input"]
                 output_colors: List[List[int]] = example["output"]
-                inputs_expanded.append(expand_matrix(input_colors))
-                outputs_expanded.append(expand_matrix(output_colors))
+
+                if augment_d4_symmetry:
+                    # Apply all 8 D4 transformations
+                    input_transforms = apply_d4_transformations(input_colors)
+                    output_transforms = apply_d4_transformations(output_colors)
+
+                    for transform_idx in range(8):
+                        filenames.append(json_file.name)
+                        indices.append(train_count + idx)
+                        subset_example_index_is_train.append(False)
+                        inputs_expanded.append(
+                            expand_matrix(input_transforms[transform_idx])
+                        )
+                        outputs_expanded.append(
+                            expand_matrix(output_transforms[transform_idx])
+                        )
+                else:
+                    # No augmentation, just add the original
+                    filenames.append(json_file.name)
+                    indices.append(train_count + idx)
+                    subset_example_index_is_train.append(False)
+                    inputs_expanded.append(expand_matrix(input_colors))
+                    outputs_expanded.append(expand_matrix(output_colors))
 
     # Filter by filename if specified
     if filename_filter is not None:
@@ -643,6 +744,7 @@ def save_data_to_npz(
     feature_ncolors: bool = False,
     feature_is_mask: bool = False,
     feature_ncells_matching_center: bool = False,
+    augment_d4_symmetry: bool = False,
 ) -> None:
     """
     Loads data using load_data_from_directory and saves it as an NPZ file.
@@ -658,6 +760,7 @@ def save_data_to_npz(
         feature_ncolors: Whether to compute and save number of distinct colors features (9 boolean features)
         feature_is_mask: Whether to compute and save binary mask features (1 feature)
         feature_ncells_matching_center: Whether to compute and save number of matching center cell features (9 boolean features)
+        augment_d4_symmetry: Whether to apply all 8 D4 symmetry transformations to augment data (8x increase)
 
     Saved NPZ file contains:
         - inputs: (n_examples, 30, 30) int32 array with color values
@@ -694,9 +797,12 @@ def save_data_to_npz(
         feature_ncolors,
         feature_is_mask,
         feature_ncells_matching_center,
+        augment_d4_symmetry,
     )
 
     print(f"Loaded {len(filenames)} examples")
+    if augment_d4_symmetry:
+        print(f"Note: Data augmented with D4 symmetry (8x multiplication)")
     print(f"Inputs shape: {inputs_array.shape}, dtype: {inputs_array.dtype}")
     print(f"Outputs shape: {outputs_array.shape}, dtype: {outputs_array.dtype}")
 
@@ -856,6 +962,12 @@ if __name__ == "__main__":
         help="Compute all available features (equivalent to enabling all feature flags)",
         default=False,
     )
+    parser.add_argument(
+        "--augment_d4_symmetry",
+        action="store_true",
+        help="Apply all 8 D4 symmetry transformations to augment data (8x increase in dataset size)",
+        default=True,
+    )
     args = parser.parse_args()
 
     # If feature_all is enabled, turn on all individual features
@@ -895,6 +1007,10 @@ if __name__ == "__main__":
         if suffix == "":
             suffix = ""  # No features requested, use default names
 
+    # Add augmentation suffix if enabled
+    if args.augment_d4_symmetry:
+        suffix += "_d4aug"
+
     train_output: str = str(output_dir / f"train{suffix}.npz")
     eval_output: str = str(output_dir / f"eval{suffix}.npz")
 
@@ -910,6 +1026,7 @@ if __name__ == "__main__":
             feature_ncolors=args.feature_ncolors,
             feature_is_mask=args.feature_is_mask,
             feature_ncells_matching_center=args.feature_ncells_matching_center,
+            augment_d4_symmetry=args.augment_d4_symmetry,
         )
         print("Training data saved successfully")
     else:
@@ -926,6 +1043,7 @@ if __name__ == "__main__":
             feature_ncolors=args.feature_ncolors,
             feature_is_mask=args.feature_is_mask,
             feature_ncells_matching_center=args.feature_ncells_matching_center,
+            augment_d4_symmetry=args.augment_d4_symmetry,
         )
         print("Evaluation data saved successfully")
     else:
