@@ -15,3 +15,6 @@ processed_data
 
 # Python cache directories
 **/__pycache__/
+optimized_checkpoints
+main_mapping_checkpoints
+color_mapping_outputs
