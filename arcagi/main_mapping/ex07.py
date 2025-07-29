@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -17,16 +17,11 @@ import wandb
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our visualization tools
+# Import the color model from ex17
+from color_mapping.ex17 import load_color_model_for_inference
+from utils import AccuracyMetricsCalculator, MetricsTracker, ValidationVisualizer
 from utils.terminal_imshow import imshow
 from utils.terminal_relshow import relshow
-
-# Import the color model from ex17
-try:
-    from color_mapping.ex17 import load_color_model_for_inference
-except ImportError:
-    print(
-        "Warning: Could not import color model from ex17. Visualization will be limited."
-    )
 
 
 class FeatureMappingModel(pl.LightningModule):
@@ -113,16 +108,26 @@ class FeatureMappingModel(pl.LightningModule):
         # Store filename for visualization (can be set externally)
         self.current_filename = None
 
+        # Initialize metrics tracker with optional wandb logging
+        self.metrics_tracker = MetricsTracker(single_file_threshold=10)
+
+        # Initialize visualization utilities
+        self.validation_visualizer = ValidationVisualizer()
+        self.accuracy_calculator = AccuracyMetricsCalculator()
+
         # Better initialization
         self.apply(self._init_weights)
 
     def set_filename(self, filename: str) -> None:
         """Set the current filename for visualization."""
         self.current_filename = filename
+        self.validation_visualizer.set_filename(filename)
 
     def set_color_model_checkpoint_dir(self, checkpoint_dir: str) -> None:
         """Set the checkpoint directory for loading color models."""
         self.color_model_checkpoint_dir = checkpoint_dir
+        self.validation_visualizer.color_model_checkpoint_dir = checkpoint_dir
+        self.accuracy_calculator.color_model_checkpoint_dir = checkpoint_dir
 
     def _create_sinusoidal_embeddings(self, hidden_dim: int) -> torch.Tensor:
         """Create sinusoidal position embeddings for a 30x30 grid."""
@@ -271,15 +276,8 @@ class FeatureMappingModel(pl.LightningModule):
             subset_is_train,
         ) = batch
 
-        # Track indices seen during training
-        if not hasattr(self, "training_indices_seen"):
-            self.training_indices_seen = set()
-            self.training_example_metrics = {}
-
-        # Track unique indices in this batch
-        batch_indices = indices.cpu().numpy()
-        for idx in batch_indices:
-            self.training_indices_seen.add(int(idx))
+        # Track batch indices for mode detection
+        self.metrics_tracker.track_batch_indices(indices)
 
         # Forward pass
         pred_features, pred_mask_logits = self(input_features)
@@ -298,80 +296,22 @@ class FeatureMappingModel(pl.LightningModule):
         # Total loss
         loss = feature_loss + self.mask_weight * mask_loss
 
-        # Track per-example metrics for single-file mode
-        if len(self.training_indices_seen) <= 10:  # Likely single-file mode
-            with torch.no_grad():
-                # Calculate per-example accuracy for order2 features
-                for i in range(len(indices)):
-                    idx = int(indices[i].item())
+        # Track per-example metrics using MetricsTracker
+        with torch.no_grad():
+            for i in range(len(indices)):
+                idx = int(indices[i].item())
 
-                    if outputs_mask[i].any():
-                        # Calculate order2 accuracy for this example
-                        pred_order2 = pred_features[i, :, :, :36]
-                        target_order2 = output_features[i, :, :, :36]
-                        pred_order2_binary = (pred_order2 > 0.5).float()
-
-                        correct = (
-                            (pred_order2_binary == target_order2)
-                            * outputs_mask[i].unsqueeze(-1)
-                        ).sum()
-                        total = outputs_mask[i].sum() * 36
-                        accuracy = correct / total if total > 0 else 0.0
-
-                        # Calculate mask accuracy for this example
-                        pred_mask_single = (pred_mask_logits[i].squeeze(-1) > 0).float()
-                        mask_correct = (
-                            pred_mask_single == outputs_mask[i].float()
-                        ).sum()
-                        mask_total = torch.numel(outputs_mask[i])
-                        mask_incorrect = mask_total - mask_correct
-                        mask_accuracy = (
-                            mask_correct / mask_total if mask_total > 0 else 0.0
-                        )
-
-                        # For color accuracy, we need the target colors which aren't directly available
-                        # in the training step. For now, we'll set this to 0.0 and implement
-                        # proper color accuracy calculation in a separate validation method.
-                        color_accuracy = 0.0
-                        color_incorrect = 0.0  # Placeholder for color incorrect count
-
-                        # Store metrics
-                        if idx not in self.training_example_metrics:
-                            self.training_example_metrics[idx] = {
-                                "count": 0,
-                                "loss_sum": 0.0,
-                                "acc_sum": 0.0,
-                                "mask_acc_sum": 0.0,
-                                "color_acc_sum": 0.0,
-                                "mask_incorrect_sum": 0.0,
-                                "color_incorrect_sum": 0.0,
-                            }
-
-                        self.training_example_metrics[idx]["count"] += 1
-                        self.training_example_metrics[idx]["loss_sum"] += loss.item()
-                        self.training_example_metrics[idx]["acc_sum"] += (
-                            accuracy.item() if torch.is_tensor(accuracy) else accuracy
-                        )
-                        self.training_example_metrics[idx]["mask_acc_sum"] += (
-                            mask_accuracy.item()
-                            if torch.is_tensor(mask_accuracy)
-                            else mask_accuracy
-                        )
-                        self.training_example_metrics[idx]["color_acc_sum"] += (
-                            color_accuracy.item()
-                            if torch.is_tensor(color_accuracy)
-                            else color_accuracy
-                        )
-                        self.training_example_metrics[idx]["mask_incorrect_sum"] += (
-                            mask_incorrect.item()
-                            if torch.is_tensor(mask_incorrect)
-                            else mask_incorrect
-                        )
-                        self.training_example_metrics[idx]["color_incorrect_sum"] += (
-                            color_incorrect.item()
-                            if torch.is_tensor(color_incorrect)
-                            else color_incorrect
-                        )
+                if outputs_mask[i].any():
+                    self.metrics_tracker.track_example_metrics(
+                        idx=idx,
+                        loss=loss,
+                        pred_features=pred_features[i],
+                        target_features=output_features[i],
+                        pred_mask_logits=pred_mask_logits[i],
+                        target_mask=outputs_mask[i],
+                        color_accuracy=0.0,  # Placeholder - not available in training
+                        color_incorrect=0.0,  # Placeholder - not available in training
+                    )
 
         # Log metrics
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -486,41 +426,9 @@ class FeatureMappingModel(pl.LightningModule):
                 print(f"Need at least 8 feature dimensions for relshow")
 
     def on_train_epoch_end(self) -> None:
-        """Show per-example metrics during training for single-file mode."""
-        # Check if we're in single-file mode by counting unique indices
-        if hasattr(self, "training_indices_seen"):
-            unique_indices = sorted(self.training_indices_seen)
-
-            # If we have indices 0-4, we're likely training on a single file
-            if len(unique_indices) >= 5 and unique_indices == list(
-                range(len(unique_indices))
-            ):
-                print(
-                    f"\nTraining Epoch {self.current_epoch} - Per-Example Performance:"
-                )
-                print("(Note: These are averaged across all augmented copies)")
-                print(
-                    f"{'Example':<10} {'Seen':<10} {'Avg Loss':<15} {'Avg Order2 Acc':<20} {'Avg Mask Acc':<15} {'Avg Color Acc':<15} {'Mask Incorrect':<15} {'Color Incorrect':<15}"
-                )
-                print("-" * 125)
-
-                for idx in unique_indices:
-                    if idx in self.training_example_metrics:
-                        metrics = self.training_example_metrics[idx]
-                        count = metrics["count"]
-                        avg_loss = metrics["loss_sum"] / count
-                        avg_acc = metrics["acc_sum"] / count
-                        avg_mask_acc = metrics["mask_acc_sum"] / count
-                        avg_color_acc = metrics["color_acc_sum"] / count
-                        avg_mask_incorrect = metrics["mask_incorrect_sum"] / count
-                        avg_color_incorrect = metrics["color_incorrect_sum"] / count
-                        print(
-                            f"{idx:<10} {count:<10} {avg_loss:<15.3f} {avg_acc:<20.2%} {avg_mask_acc:<15.2%} {avg_color_acc:<15.2%} {avg_mask_incorrect:<15.1f} {avg_color_incorrect:<15.1f}"
-                        )
-
-            # Reset for next epoch
-            self.training_indices_seen = set()
-            self.training_example_metrics = {}
+        """Show per-example metrics during training for single-file mode using MetricsTracker."""
+        self.metrics_tracker.print_epoch_summary(self.current_epoch)
+        self.metrics_tracker.reset()
 
     def validation_step(
         self, batch: Tuple[torch.Tensor, ...], batch_idx: int
@@ -584,86 +492,24 @@ class FeatureMappingModel(pl.LightningModule):
             prog_bar=True,
         )
 
-        # Calculate per-example metrics (enhanced to match training metrics)
-        per_example_data = []
-        for i in range(len(indices)):
-            example_idx = indices[i].item()
+        # Track validation metrics using MetricsTracker
+        self.metrics_tracker.track_validation_step(
+            loss=loss,
+            order2_accuracy=order2_accuracy,
+            mask_accuracy=mask_accuracy,
+            pred_features=pred_features,
+            target_features=output_features,
+            pred_mask_logits=pred_mask_logits,
+            target_mask=outputs_mask,
+            indices=indices,
+        )
 
-            # Calculate non-mask pixels for this example
-            valid_pixels = outputs_mask[i].sum().item()
-
-            # Calculate correctly predicted pixels (for order2 features)
-            if valid_pixels > 0:
-                pred_order2_ex = pred_features[i, :, :, :36]
-                target_order2_ex = output_features[i, :, :, :36]
-                pred_order2_binary_ex = (pred_order2_ex > 0.5).float()
-
-                # Count pixels where ALL 36 order2 features match
-                all_features_match = (pred_order2_binary_ex == target_order2_ex).all(
-                    dim=-1
-                )
-                correct_pixels = (all_features_match * outputs_mask[i]).sum()
-
-                # Calculate order2 accuracy
-                order2_correct = (
-                    (pred_order2_binary_ex == target_order2_ex)
-                    * outputs_mask[i].unsqueeze(-1)
-                ).sum()
-                order2_total = outputs_mask[i].sum() * 36
-                order2_accuracy = (
-                    order2_correct / order2_total if order2_total > 0 else 0.0
-                )
-            else:
-                correct_pixels = 0
-                order2_accuracy = 0.0
-
-            # Calculate mask accuracy for this example
-            pred_mask_single = (pred_mask_logits[i].squeeze(-1) > 0).float()
-            mask_correct = (pred_mask_single == outputs_mask[i].float()).sum()
-            mask_total = torch.numel(outputs_mask[i])
-            mask_incorrect = mask_total - mask_correct
-            mask_accuracy = mask_correct / mask_total if mask_total > 0 else 0.0
-
-            # Color accuracy placeholder (same as training)
-            color_accuracy = 0.0
-            color_incorrect = 0.0
-
-            per_example_data.append(
-                {
-                    "index": example_idx,
-                    "valid_pixels": valid_pixels,
-                    "correct_pixels": (
-                        correct_pixels.item()
-                        if torch.is_tensor(correct_pixels)
-                        else correct_pixels
-                    ),
-                    "order2_accuracy": (
-                        order2_accuracy.item()
-                        if torch.is_tensor(order2_accuracy)
-                        else order2_accuracy
-                    ),
-                    "mask_accuracy": (
-                        mask_accuracy.item()
-                        if torch.is_tensor(mask_accuracy)
-                        else mask_accuracy
-                    ),
-                    "color_accuracy": color_accuracy,
-                    "mask_incorrect": (
-                        mask_incorrect.item()
-                        if torch.is_tensor(mask_incorrect)
-                        else mask_incorrect
-                    ),
-                    "color_incorrect": color_incorrect,
-                }
-            )
-
-        # Store outputs for epoch-level metrics
+        # Also store in self.validation_outputs for Lightning logging compatibility
         self.validation_outputs.append(
             {
                 "val_loss": loss,
                 "val_order2_acc": order2_accuracy,
                 "val_mask_acc": mask_accuracy,
-                "per_example_data": per_example_data,
             }
         )
 
@@ -702,13 +548,15 @@ class FeatureMappingModel(pl.LightningModule):
         """Reset validation outputs at the start of each epoch."""
         self.validation_outputs = []
         self.validation_examples_for_viz = []
+        # Reset validation state in MetricsTracker
+        self.metrics_tracker.validation_outputs = []
 
     def on_validation_epoch_end(self) -> None:
-        """Aggregate and log validation metrics."""
+        """Aggregate and log validation metrics using MetricsTracker."""
         if not self.validation_outputs:
             return
 
-        # Calculate average metrics
+        # Calculate average metrics for Lightning logging (needed for checkpoint callback)
         avg_loss = torch.stack(
             [out["val_loss"] for out in self.validation_outputs]
         ).mean()
@@ -723,334 +571,36 @@ class FeatureMappingModel(pl.LightningModule):
         self.log("val_epoch_order2_acc", avg_order2_acc, prog_bar=True)
         self.log("val_epoch_mask_acc", avg_mask_acc, prog_bar=True)
 
-        # Check if we're training on a single file by looking at unique indices
-        all_indices = []
-        for output in self.validation_outputs:
-            for example_data in output["per_example_data"]:
-                all_indices.append(example_data["index"])
-
-        unique_indices = sorted(set(all_indices))
-
-        # If we have many indices (0,1,2,3,4...) from a single file, show per-example metrics
-        # If we have just indices 0,1 repeated many times, show aggregated metrics
-        single_file_mode = len(unique_indices) > 2 or (
-            len(unique_indices) <= 2 and len(all_indices) <= 10
-        )
-
-        if single_file_mode:
-            # Single file mode: show enhanced metrics for each individual example
-            print(f"\nValidation Epoch {self.current_epoch} - Per-Example Performance:")
-            print("(Enhanced metrics matching training format)")
-            print(
-                f"{'Example':<10} {'Valid Pixels':<15} {'Order2 Acc':<15} {'Mask Acc':<15} {'Color Acc':<15} {'Mask Incorrect':<15} {'Color Incorrect':<15}"
-            )
-            print("-" * 115)
-
-            # Collect metrics for each example in order
-            example_metrics = {}
-            for output in self.validation_outputs:
-                for example_data in output["per_example_data"]:
-                    idx = example_data["index"]
-                    if idx not in example_metrics:
-                        example_metrics[idx] = example_data
-
-            # Display in order
-            for idx in sorted(example_metrics.keys()):
-                metrics = example_metrics[idx]
-                valid_pixels = metrics["valid_pixels"]
-                correct_pixels = metrics["correct_pixels"]
-                order2_acc = metrics.get("order2_accuracy", 0.0)
-                mask_acc = metrics.get("mask_accuracy", 0.0)
-                color_acc = metrics.get("color_accuracy", 0.0)
-                mask_incorrect = metrics.get("mask_incorrect", 0.0)
-                color_incorrect = metrics.get("color_incorrect", 0.0)
-
-                print(
-                    f"{idx:<10} {valid_pixels:<15} {order2_acc:<15.2%} {mask_acc:<15.2%} {color_acc:<15.2%} {mask_incorrect:<15.1f} {color_incorrect:<15.1f}"
-                )
-
-                # Enhanced wandb logging
-                self.log(f"val_example_{idx}_valid_pixels", float(valid_pixels))
-                self.log(f"val_example_{idx}_correct_pixels", float(correct_pixels))
-                self.log(f"val_example_{idx}_order2_accuracy", float(order2_acc))
-                self.log(f"val_example_{idx}_mask_accuracy", float(mask_acc))
-                self.log(f"val_example_{idx}_color_accuracy", float(color_acc))
-                self.log(f"val_example_{idx}_mask_incorrect", float(mask_incorrect))
-                self.log(f"val_example_{idx}_color_incorrect", float(color_incorrect))
-        else:
-            # Multi-file mode: aggregate enhanced metrics by index
-            index_metrics = {}
-            for output in self.validation_outputs:
-                for example_data in output["per_example_data"]:
-                    idx = example_data["index"]
-                    if idx not in index_metrics:
-                        index_metrics[idx] = {
-                            "valid_pixels_sum": example_data["valid_pixels"],
-                            "correct_pixels_sum": example_data["correct_pixels"],
-                            "order2_acc_sum": example_data.get("order2_accuracy", 0.0),
-                            "mask_acc_sum": example_data.get("mask_accuracy", 0.0),
-                            "color_acc_sum": example_data.get("color_accuracy", 0.0),
-                            "mask_incorrect_sum": example_data.get(
-                                "mask_incorrect", 0.0
-                            ),
-                            "color_incorrect_sum": example_data.get(
-                                "color_incorrect", 0.0
-                            ),
-                            "count": 1,
-                        }
-                    else:
-                        # Same index can appear multiple times in validation set
-                        index_metrics[idx]["valid_pixels_sum"] += example_data[
-                            "valid_pixels"
-                        ]
-                        index_metrics[idx]["correct_pixels_sum"] += example_data[
-                            "correct_pixels"
-                        ]
-                        index_metrics[idx]["order2_acc_sum"] += example_data.get(
-                            "order2_accuracy", 0.0
-                        )
-                        index_metrics[idx]["mask_acc_sum"] += example_data.get(
-                            "mask_accuracy", 0.0
-                        )
-                        index_metrics[idx]["color_acc_sum"] += example_data.get(
-                            "color_accuracy", 0.0
-                        )
-                        index_metrics[idx]["mask_incorrect_sum"] += example_data.get(
-                            "mask_incorrect", 0.0
-                        )
-                        index_metrics[idx]["color_incorrect_sum"] += example_data.get(
-                            "color_incorrect", 0.0
-                        )
-                        index_metrics[idx]["count"] += 1
-
-            # Report enhanced per-index metrics in ascending order
-            if index_metrics:
-                print(
-                    f"\nValidation Epoch {self.current_epoch} - Per-Index Performance (averaged):"
-                )
-                print("(Enhanced metrics matching training format)")
-                print(
-                    f"{'Index':<10} {'Count':<10} {'Avg Valid Pixels':<18} {'Avg Order2 Acc':<18} {'Avg Mask Acc':<15} {'Avg Color Acc':<15} {'Avg Mask Incorrect':<20} {'Avg Color Incorrect':<20}"
-                )
-                print("-" * 140)
-
-                for idx in sorted(index_metrics.keys()):
-                    metrics = index_metrics[idx]
-                    count = metrics["count"]
-                    avg_valid_pixels = metrics["valid_pixels_sum"] / count
-                    avg_correct_pixels = metrics["correct_pixels_sum"] / count
-                    avg_order2_acc = metrics["order2_acc_sum"] / count
-                    avg_mask_acc = metrics["mask_acc_sum"] / count
-                    avg_color_acc = metrics["color_acc_sum"] / count
-                    avg_mask_incorrect = metrics["mask_incorrect_sum"] / count
-                    avg_color_incorrect = metrics["color_incorrect_sum"] / count
-
-                    print(
-                        f"{idx:<10} {count:<10} {avg_valid_pixels:<18.1f} {avg_order2_acc:<18.2%} {avg_mask_acc:<15.2%} {avg_color_acc:<15.2%} {avg_mask_incorrect:<20.1f} {avg_color_incorrect:<20.1f}"
-                    )
-
-                    # Enhanced wandb logging
-                    self.log(f"val_idx_{idx}_count", float(count))
-                    self.log(f"val_idx_{idx}_avg_valid_pixels", float(avg_valid_pixels))
-                    self.log(
-                        f"val_idx_{idx}_avg_correct_pixels", float(avg_correct_pixels)
-                    )
-                    self.log(
-                        f"val_idx_{idx}_avg_order2_accuracy", float(avg_order2_acc)
-                    )
-                    self.log(f"val_idx_{idx}_avg_mask_accuracy", float(avg_mask_acc))
-                    self.log(f"val_idx_{idx}_avg_color_accuracy", float(avg_color_acc))
-                    self.log(
-                        f"val_idx_{idx}_avg_mask_incorrect", float(avg_mask_incorrect)
-                    )
-                    self.log(
-                        f"val_idx_{idx}_avg_color_incorrect", float(avg_color_incorrect)
-                    )
+        # Print validation summary using MetricsTracker
+        self.metrics_tracker.print_validation_summary(self.current_epoch)
 
         # Edge visualization for validation examples (test subset only)
-        if self.validation_examples_for_viz:
-            print(
-                f"\n\033[1m========== Edge Visualization - Test Subset (Epoch {self.current_epoch}) ==========\033[0m"
-            )
+        self.validation_visualizer.visualize_validation_examples(
+            self.validation_examples_for_viz, self.current_epoch
+        )
 
-            for i, example in enumerate(self.validation_examples_for_viz):
-                example_idx = example["example_idx"]
-                pred_edges = example["predicted_edges"]
-                target_edges = example["target_edges"]
-                mask = example["mask"]
-
-                print(
-                    f"\n\033[1mTest Example {example_idx} (Validation #{i+1}):\033[0m"
+        # Calculate and print accuracy metrics for examples with color model
+        for example in self.validation_examples_for_viz:
+            if (
+                self.current_filename
+                and "predicted_full" in example
+                and "target_full" in example
+                and "predicted_mask_logits" in example
+            ):
+                self.accuracy_calculator.calculate_and_print_metrics(
+                    example["predicted_full"],
+                    example["target_full"],
+                    example["mask"],
+                    example["example_idx"],
+                    example["predicted_mask_logits"],
+                    self.current_filename,
                 )
-
-                # Only show non-mask regions for better visualization
-                if mask.any():
-                    # Find bounding box of non-mask region
-                    mask_coords = torch.where(mask)
-                    if len(mask_coords[0]) > 0:
-                        min_y, max_y = (
-                            mask_coords[0].min().item(),
-                            mask_coords[0].max().item(),
-                        )
-                        min_x, max_x = (
-                            mask_coords[1].min().item(),
-                            mask_coords[1].max().item(),
-                        )
-
-                        # Add small padding
-                        min_y = max(0, min_y - 1)
-                        max_y = min(29, max_y + 1)
-                        min_x = max(0, min_x - 1)
-                        max_x = min(29, max_x + 1)
-
-                        # Extract regions
-                        pred_region = pred_edges[
-                            min_y : max_y + 1, min_x : max_x + 1, :
-                        ]
-                        target_region = target_edges[
-                            min_y : max_y + 1, min_x : max_x + 1, :
-                        ]
-
-                        # Convert predictions to binary (threshold at 0.5)
-                        pred_region_binary = (pred_region > 0.5).float()
-
-                        try:
-                            print(f"Expected output (full 30x30 image):")
-                            if self.current_filename and "target_full" in example:
-                                # Show full 30x30 features to color model
-                                self.visualize_with_color_model(
-                                    example["target_full"],  # Full 30x30 features
-                                    self.current_filename,
-                                    f"Expected_Ex{example_idx}",
-                                )
-                            else:
-                                relshow(target_region, title=None)
-
-                            print(f"Predicted output (full 30x30 image):")
-                            if self.current_filename and "predicted_full" in example:
-                                # Show full 30x30 features to color model
-                                self.visualize_with_color_model(
-                                    example["predicted_full"],  # Full 30x30 features
-                                    self.current_filename,
-                                    f"Predicted_Ex{example_idx}",
-                                )
-                            else:
-                                relshow(pred_region_binary, title=None)
-
-                            # Calculate and print accuracies using color model
-                            if (
-                                self.current_filename
-                                and "predicted_full" in example
-                                and "target_full" in example
-                            ):
-                                self._print_accuracy_metrics(
-                                    example["predicted_full"],
-                                    example["target_full"],
-                                    example["mask"],
-                                    example_idx,
-                                    example["predicted_mask_logits"],
-                                )
-
-                        except Exception as e:
-                            print(f"Error visualizing example {example_idx}: {e}")
-                else:
-                    print(f"  (No non-mask pixels to visualize)")
 
         # Clear validation outputs
         self.validation_outputs = []
         self.validation_examples_for_viz = []
-
-    def _print_accuracy_metrics(
-        self,
-        predicted_features: torch.Tensor,
-        target_features: torch.Tensor,
-        target_mask: torch.Tensor,
-        example_idx: int,
-        predicted_mask_logits: torch.Tensor,
-    ) -> None:
-        """Calculate and print color and mask accuracy metrics."""
-        try:
-            # Load the color model for this filename
-            checkpoint_dir = getattr(
-                self, "color_model_checkpoint_dir", "optimized_checkpoints"
-            )
-            color_model = load_color_model_for_inference(
-                self.current_filename, checkpoint_dir=checkpoint_dir
-            )
-
-            # Predict colors and masks from both predicted and target features
-            with torch.no_grad():
-                # Get predictions for both features (add batch dimension)
-                pred_colors = color_model.predict_colors(
-                    predicted_features.unsqueeze(0)
-                )[
-                    0
-                ]  # Remove batch dim
-                target_colors = color_model.predict_colors(
-                    target_features.unsqueeze(0)
-                )[
-                    0
-                ]  # Remove batch dim
-
-                # Convert the passed-in logits to a binary mask
-                pred_mask = (predicted_mask_logits.squeeze(-1) > 0).float()
-
-                # Convert target_mask to same device and type as predictions
-                target_mask = target_mask.to(pred_colors.device)
-
-                # 1. Calculate mask accuracy (predicted mask vs target mask)
-                mask_correct = (pred_mask == target_mask).sum().item()
-                mask_total = target_mask.numel()
-                mask_accuracy = mask_correct / mask_total if mask_total > 0 else 0.0
-
-                # 2. Calculate color accuracy within the PREDICTED mask region only
-                pred_mask_area = pred_mask.sum().item()
-                if pred_mask_area > 0:
-                    # Only consider pixels where predicted mask is True
-                    color_correct_in_pred_mask = (
-                        ((pred_colors == target_colors) & pred_mask).sum().item()
-                    )
-                    color_accuracy_in_pred_mask = (
-                        color_correct_in_pred_mask / pred_mask_area
-                    )
-                else:
-                    color_accuracy_in_pred_mask = 0.0
-                    color_correct_in_pred_mask = 0
-
-                # 3. Calculate color accuracy within the TARGET mask region (for comparison)
-                target_mask_area = target_mask.sum().item()
-                if target_mask_area > 0:
-                    color_correct_in_target_mask = (
-                        ((pred_colors == target_colors) & target_mask).sum().item()
-                    )
-                    color_accuracy_in_target_mask = (
-                        color_correct_in_target_mask / target_mask_area
-                    )
-                else:
-                    color_accuracy_in_target_mask = 0.0
-                    color_correct_in_target_mask = 0
-
-                # Print the metrics
-                print(f"\n📊 Accuracy Metrics for Example {example_idx}:")
-                print(
-                    f"  🎯 Mask Accuracy: {mask_accuracy:.1%} ({mask_correct}/{mask_total} pixels)"
-                )
-                print(
-                    f"  🎨 Color Accuracy (in predicted mask): {color_accuracy_in_pred_mask:.1%} ({color_correct_in_pred_mask}/{pred_mask_area} pixels)"
-                )
-                print(
-                    f"  🎨 Color Accuracy (in target mask): {color_accuracy_in_target_mask:.1%} ({color_correct_in_target_mask}/{target_mask_area} pixels)"
-                )
-
-                # Additional info about mask differences
-                if pred_mask_area != target_mask_area:
-                    diff = pred_mask_area - target_mask_area
-                    print(
-                        f"  ℹ️  Predicted mask size differs by {diff:+d} pixels from target"
-                    )
-
-        except Exception as e:
-            print(f"  ❌ Could not calculate accuracy metrics: {e}")
+        # Clear validation outputs in MetricsTracker
+        self.metrics_tracker.validation_outputs = []
 
     def configure_optimizers(self) -> Dict[str, Any]:
         optimizer = torch.optim.AdamW(
@@ -1583,6 +1133,7 @@ def main():
 
     # Create wandb logger if enabled
     logger = None
+    wandb_log_fn = None
     if not args.no_wandb:
         wandb_config = {
             "architecture": "MessagePassingFeatureMapper",
@@ -1613,6 +1164,19 @@ def main():
         # Set wandb to log frequently
         if wandb.run:
             wandb.run.settings.update({"_log_every_n_steps": 1})
+
+        # Create wandb logging function for MetricsTracker
+        def wandb_log_fn(metric_name: str, value: float) -> None:
+            if wandb.run:
+                wandb.log({metric_name: value})
+
+    # Set up MetricsTracker with wandb logging
+    if wandb_log_fn:
+        model.metrics_tracker = MetricsTracker(
+            single_file_threshold=10, wandb_logger=wandb_log_fn
+        )
+    else:
+        model.metrics_tracker = MetricsTracker(single_file_threshold=10)
 
     # Create trainer with callbacks
     checkpoint_callback = ModelCheckpoint(
