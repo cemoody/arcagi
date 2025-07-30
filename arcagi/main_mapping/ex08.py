@@ -670,7 +670,7 @@ class SpatialMessagePassing(nn.Module):
             hidden_dim,
             kernel_size=3,
             padding=1,
-            # groups=hidden_dim // 16,  # Group convolution for efficiency
+            groups=hidden_dim // 16,  # Group convolution for efficiency
         )
 
         self.norm = nn.LayerNorm(hidden_dim)

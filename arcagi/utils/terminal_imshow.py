@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-import torch
-from typing import Optional, List, Set
 import sys
 from pathlib import Path
+from typing import List, Optional, Set
+
+import torch
 
 
 def imshow(
-    matrix: torch.Tensor, title: Optional[str] = None, show_legend: bool = True
+    matrix: torch.Tensor,
+    title: Optional[str] = None,
+    show_legend: bool = True,
+    correct: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Prints a 2D PyTorch tensor as a colored grid to the terminal.
@@ -16,10 +20,26 @@ def imshow(
         matrix: A 2D PyTorch tensor of integers, where each integer represents a color.
         title: Optional title to display above the image.
         show_legend: Whether to show a legend mapping colors to values.
+        correct: Optional 2D boolean tensor of same shape as matrix.
+                If provided, incorrect predictions (False values) will be displayed in bold.
     """
     # Ensure matrix is 2D
     if matrix.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {matrix.dim()}D tensor")
+
+    # Validate correct array if provided
+    if correct is not None:
+        if correct.shape != matrix.shape:
+            raise ValueError(
+                f"correct array shape {correct.shape} must match matrix shape {matrix.shape}"
+            )
+        if correct.dim() != 2:
+            raise ValueError(f"Expected 2D correct tensor, got {correct.dim()}D tensor")
+        # Convert to CPU and numpy for processing
+        correct_np = correct.cpu().numpy()  # type: ignore
+        correct_list = correct_np.tolist()
+    else:
+        correct_list = None
 
     # Convert to CPU numpy array and then to list
     matrix_np = matrix.cpu().numpy()  # type: ignore
@@ -45,8 +65,10 @@ def imshow(
         "\033[107m",  # Bright white background
     ]
 
-    # Reset code
+    # Reset code and formatting codes
     reset = "\033[0m"
+    bold = "\033[1m"
+    underline = "\033[4m"
 
     # Print title if provided
     if title:
@@ -60,13 +82,21 @@ def imshow(
                 unique_values.add(val)
 
     # Print each row of the matrix
-    for row in matrix_list:
+    for row_idx, row in enumerate(matrix_list):
         row_str = ""
-        for val in row:
+        for col_idx, val in enumerate(row):
+            # Check if this prediction is incorrect (for special formatting)
+            is_incorrect = (
+                correct_list is not None and not correct_list[row_idx][col_idx]
+            )
+
             if isinstance(val, int) and val == -1:
                 # Background (use space with black background)
                 # Using 3 spaces to match the width of " NN " format
-                row_str += f"\033[40m   \033[0m"
+                if is_incorrect:
+                    row_str += f"{bold}{underline}\033[40m   {reset}"
+                else:
+                    row_str += f"\033[40m   {reset}"
             else:
                 # Get the appropriate color based on value
                 val_int = int(val)
@@ -74,9 +104,17 @@ def imshow(
                 # Format to ensure consistent width with spaces on both sides
                 # Single digit numbers: " N " (3 chars), double digits: "NN " (3 chars)
                 if val_int < 10:
-                    row_str += f"{colors[color_idx]} {val_int} {reset}"
+                    if is_incorrect:
+                        # Use brackets around incorrect predictions for clear visibility
+                        row_str += f"{colors[color_idx]}[{val_int}]{reset}"
+                    else:
+                        row_str += f"{colors[color_idx]} {val_int} {reset}"
                 else:
-                    row_str += f"{colors[color_idx]}{val_int} {reset}"
+                    if is_incorrect:
+                        # Use brackets around incorrect predictions for clear visibility
+                        row_str += f"{colors[color_idx]}[{val_int}]{reset}"
+                    else:
+                        row_str += f"{colors[color_idx]}{val_int} {reset}"
 
         print(row_str)
 
@@ -119,6 +157,34 @@ if __name__ == "__main__":
     with_background[0:10:3, 0:10:3] = -1
     imshow(with_background, title="Pattern with Background (-1 values)")
 
+    # Test with correct array - some predictions are incorrect (bold)
+    print("\n" + "=" * 60)
+    print("Testing correct array functionality (bold = incorrect)")
+    print("=" * 60)
+
+    test_matrix = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 0, 1], [2, 3, 4, 5]], dtype=torch.int
+    )
+
+    # Mark some predictions as incorrect (these will be bold)
+    correct_array = torch.tensor(
+        [
+            [True, False, True, False],  # Alternating correct/incorrect
+            [False, True, False, True],  # Alternating incorrect/correct
+            [True, True, False, False],  # Mixed pattern
+            [False, False, True, True],  # Mixed pattern
+        ]
+    )
+
+    imshow(
+        test_matrix,
+        title="With Correct Array (bold = incorrect predictions)",
+        correct=correct_array,
+    )
+
+    # Show the same matrix without correct array for comparison
+    imshow(test_matrix, title="Same Matrix Without Correct Array (normal display)")
+
     # Test with a larger 30x30 matrix (similar to what's used in the ARC dataset)
     large_matrix = torch.full((30, 30), -1, dtype=torch.int)
     # Draw a simple pattern in the center
@@ -131,44 +197,83 @@ if __name__ == "__main__":
     # Add parent directory to path so we can import data_loader
     project_root = Path(__file__).parent.parent.parent
     sys.path.append(str(project_root))
-    from arcagi.data_loader import JSONDataModule
 
-    # Look for the data directory
-    possible_data_dirs = [
-        project_root / "ARC-AGI" / "data" / "training",
-        project_root / "ARC-AGI-2" / "data" / "training",
-        project_root / "data" / "training",
-    ]
+    try:
+        from arcagi.data_loader import create_dataloader, load_npz_data
 
-    train_dir = None
-    for data_dir in possible_data_dirs:
-        if data_dir.exists():
-            train_dir = str(data_dir)
-            break
-
-    # Check if directory exists
-    if train_dir is not None:
-        print(f"\nFound ARC dataset at: {train_dir}")
-        data_module = JSONDataModule(train_dir=train_dir, batch_size=1)
-        data_module.setup()
-
-        # Get a batch from the dataloader
-        train_loader = data_module.train_dataloader()
-        batch = next(iter(train_loader))
-
-        # Display input and output
-        input_tensor = batch["input_colors_expanded"][0]
-        output_tensor = batch["output_colors_expanded"][0]
-
-        print("\n\033[1m========== Real ARC Example ==========\033[0m")
+        data_loader_available = True
+    except ImportError:
         print(
-            f"\033[1mFrom file: {batch['filename'][0]}, Example {batch['example_index'][0]}\033[0m"
+            "\nData loader functions not available. Skipping real ARC example visualization."
         )
+        data_loader_available = False
 
-        imshow(input_tensor, title="Input")
-        imshow(output_tensor, title="Expected Output")
+    if data_loader_available:
+        # Look for the data directory with processed NPZ files
+        possible_data_dirs = [
+            project_root / "processed_data",
+            project_root / "processed_data_v2",
+            project_root / "data",
+        ]
+
+        data_file = None
+        for data_dir in possible_data_dirs:
+            if data_dir.exists():
+                # Look for NPZ files in the directory
+                npz_files = list(data_dir.glob("*.npz"))
+                if npz_files:
+                    data_file = str(npz_files[0])  # Use the first NPZ file found
+                    break
+
+        # Check if we found processed data
+        if data_file is not None:
+            print(f"\nFound processed ARC data at: {data_file}")
+            try:
+                # Load the data
+                (
+                    filenames,
+                    indices,
+                    inputs,
+                    outputs,
+                    inputs_features,
+                    outputs_features,
+                    subset_example_index_is_train,
+                    inputs_mask,
+                    outputs_mask,
+                    indices_tensor,
+                ) = load_npz_data(data_file)
+
+                # Create a simple dataloader
+                dataloader = create_dataloader(
+                    inputs, outputs, batch_size=1, shuffle=False
+                )
+
+                # Get first batch
+                batch_data = next(iter(dataloader))
+                input_tensor = batch_data[0][0]  # First input from first batch
+                output_tensor = batch_data[1][0]  # First output from first batch
+
+                # Convert from one-hot back to color indices for display
+                input_colors = torch.argmax(input_tensor, dim=-1)
+                output_colors = torch.argmax(output_tensor, dim=-1)
+
+                print("\n\033[1m========== Real ARC Example ==========\033[0m")
+                print(f"\033[1mFrom file: {filenames[0]}, Example {indices[0]}\033[0m")
+
+                imshow(input_colors, title="Input")
+                imshow(output_colors, title="Expected Output")
+
+            except Exception as e:
+                print(f"\nError loading ARC data: {e}")
+                print("Skipping real example visualization.")
+        else:
+            print(
+                "\nProcessed ARC data not found. Skipping real example visualization."
+            )
+            print("Expected to find NPZ files in one of:")
+            for path in possible_data_dirs:
+                print(f"  - {path}")
     else:
-        print("\nARC dataset not found. Skipping real example visualization.")
-        print("Expected to find the dataset in one of:")
-        for path in possible_data_dirs:
-            print(f"  - {path}")
+        print(
+            "Consider running preprocessing to create NPZ files for real ARC examples."
+        )

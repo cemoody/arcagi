@@ -13,6 +13,33 @@ import torch
 # Import visualization tools
 from utils.terminal_relshow import relshow
 
+# Global color model cache
+_COLOR_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def get_color_model_for_filename(
+    filename: str, checkpoint_dir: str = "optimized_checkpoints"
+) -> Any:
+    """Get or load color model for a specific filename, with caching."""
+    cache_key = f"{filename}_{checkpoint_dir}"
+
+    if cache_key not in _COLOR_MODEL_CACHE:
+        try:
+            # Import color model function locally to avoid circular imports
+            from color_mapping.ex17 import load_color_model_for_inference
+
+            print(f"Loading color model for {filename}...")
+            color_model = load_color_model_for_inference(
+                filename, checkpoint_dir=checkpoint_dir
+            )
+            _COLOR_MODEL_CACHE[cache_key] = color_model
+            print(f"✅ Color model cached for {filename}")
+        except Exception as e:
+            print(f"❌ Failed to load color model for {filename}: {e}")
+            _COLOR_MODEL_CACHE[cache_key] = None
+
+    return _COLOR_MODEL_CACHE[cache_key]
+
 
 class ValidationVisualizer:
     """Handles visualization of validation results including edge visualization and color outputs."""
@@ -25,23 +52,33 @@ class ValidationVisualizer:
         """Initialize visualizer with optional color model support."""
         self.current_filename = current_filename
         self.color_model_checkpoint_dir = color_model_checkpoint_dir
+        # Pre-load color model if filename is provided
+        if current_filename:
+            get_color_model_for_filename(current_filename, color_model_checkpoint_dir)
 
     def set_filename(self, filename: str) -> None:
         """Set the current filename for color model visualization."""
         self.current_filename = filename
+        # Pre-load color model for the new filename
+        get_color_model_for_filename(filename, self.color_model_checkpoint_dir)
 
     def visualize_with_color_model(
-        self, features: torch.Tensor, filename: str, title: str
+        self,
+        features: torch.Tensor,
+        filename: str,
+        title: str,
+        target_features: Optional[torch.Tensor] = None,
     ) -> None:
-        """Visualize features using the color model."""
-        # Import color model function locally to avoid circular imports
-        from color_mapping.ex17 import load_color_model_for_inference
+        """Visualize features using the cached color model."""
+        color_model = get_color_model_for_filename(
+            filename, self.color_model_checkpoint_dir
+        )
+
+        if color_model is None:
+            print(f"❌ No color model available for {filename}")
+            return
 
         try:
-            color_model = load_color_model_for_inference(
-                filename, checkpoint_dir=self.color_model_checkpoint_dir
-            )
-
             with torch.no_grad():
                 colors = color_model.predict_colors(features.unsqueeze(0))[0]
                 masks = color_model.predict_masks(features.unsqueeze(0))[0]
@@ -49,6 +86,16 @@ class ValidationVisualizer:
                 # Convert to numpy for visualization
                 colors_np = colors.cpu().numpy()
                 masks_np = (masks > 0.5).cpu().numpy().astype(bool)
+
+                # Compute correct array if target features are provided
+                correct_np = None
+                if target_features is not None:
+                    target_colors = color_model.predict_colors(
+                        target_features.unsqueeze(0)
+                    )[0]
+                    # Compare predicted colors to target colors
+                    correct_tensor = colors == target_colors
+                    correct_np = correct_tensor.cpu().numpy()
 
                 # Create color map (fallback if get_color_palette doesn't exist)
                 try:
@@ -65,17 +112,20 @@ class ValidationVisualizer:
                     }
 
                 # Display the colored output
-                self._display_colored_output(colors_np, masks_np, color_map, title)
+                self._display_colored_output(
+                    colors_np, masks_np, color_map, title, correct_np
+                )
 
         except Exception as e:
             print(f"Error in color model visualization for {title}: {e}")
 
     def _display_colored_output(
         self,
-        colors: np.ndarray,
-        masks: np.ndarray,
+        colors: np.ndarray[Any, np.dtype[Any]],
+        masks: np.ndarray[Any, np.dtype[Any]],
         color_map: Dict[int, str],
         title: str,
+        correct: Optional[np.ndarray[Any, np.dtype[Any]]] = None,
     ) -> None:
         """Display colored output in terminal using colored visualization."""
         # Use colored terminal display function (now required import)
@@ -89,9 +139,25 @@ class ValidationVisualizer:
         # Convert to torch tensor for imshow
         display_tensor = torch.from_numpy(display_matrix).int()
 
+        # Convert correct array to torch tensor if provided
+        correct_tensor = None
+        if correct is not None:
+            # Apply the same masking to the correct array
+            correct_masked = np.full_like(
+                correct, True, dtype=bool
+            )  # Default to correct for background
+            correct_masked[masks] = correct[
+                masks
+            ]  # Use actual correct values only in mask regions
+            correct_tensor = torch.from_numpy(correct_masked)
+
         # Display with colors
         print(f"🎨 Using colored terminal display for {title}")
-        imshow(display_tensor, title=f"{title} - {self.current_filename}")
+        imshow(
+            display_tensor,
+            title=f"{title} - {self.current_filename}",
+            correct=correct_tensor,
+        )
 
     def visualize_validation_examples(
         self, validation_examples: List[Dict[str, Any]], current_epoch: int
@@ -178,11 +244,12 @@ class ValidationVisualizer:
 
         print(f"Predicted output (full 30x30 image):")
         if self.current_filename and "predicted_full" in example:
-            # Show full 30x30 features to color model
+            # Show full 30x30 features to color model with target for comparison
             self.visualize_with_color_model(
                 example["predicted_full"],  # Full 30x30 features
                 self.current_filename,
                 f"Predicted_Ex{example_idx}",
+                target_features=example["target_full"],  # Pass target for comparison
             )
         else:
             relshow(pred_region_binary, title=None)
@@ -205,15 +272,15 @@ class AccuracyMetricsCalculator:
         current_filename: str,
     ) -> Dict[str, float]:
         """Calculate and print comprehensive accuracy metrics."""
-        # Import color model function locally to avoid circular imports
-        from color_mapping.ex17 import load_color_model_for_inference
+        color_model = get_color_model_for_filename(
+            current_filename, self.color_model_checkpoint_dir
+        )
+
+        if color_model is None:
+            print(f"  ❌ Could not load color model for {current_filename}")
+            return {}
 
         try:
-            # Load the color model for this filename
-            color_model = load_color_model_for_inference(
-                current_filename, checkpoint_dir=self.color_model_checkpoint_dir
-            )
-
             # Calculate metrics
             metrics = self._compute_accuracy_metrics(
                 predicted_features,
@@ -238,7 +305,7 @@ class AccuracyMetricsCalculator:
         target_features: torch.Tensor,
         target_mask: torch.Tensor,
         predicted_mask_logits: torch.Tensor,
-        color_model,
+        color_model: Any,
     ) -> Dict[str, float]:
         """Compute all accuracy metrics."""
         with torch.no_grad():

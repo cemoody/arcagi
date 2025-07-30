@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 def load_npz_data(
     npz_path: str,
     use_features: bool = False,
+    load_masks_and_indices: bool = False,
 ) -> Tuple[
     List[str],
     List[int],
@@ -17,6 +18,9 @@ def load_npz_data(
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[NDArray[np.bool_]],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
 ]:
     """
     Loads data from an NPZ file created by preprocess_v2.py and creates PyTorch tensors.
@@ -24,6 +28,7 @@ def load_npz_data(
     Args:
         npz_path: Path to the NPZ file
         use_features: Whether to load concatenated features (if available)
+        load_masks_and_indices: Whether to load mask data and indices (for feature mapping)
 
     Returns:
         filenames: List of filename strings
@@ -33,6 +38,9 @@ def load_npz_data(
         inputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
         outputs_features: torch.Tensor of shape (n_examples, 30, 30, n_features) with binary features (if use_features=True and available)
         subset_example_index_is_train: np.ndarray of booleans indicating if example is from "train" subset (True) or "test" subset (False)
+        inputs_mask: torch.Tensor of shape (n_examples, 30, 30) with boolean masks (if load_masks_and_indices=True and available)
+        outputs_mask: torch.Tensor of shape (n_examples, 30, 30) with boolean masks (if load_masks_and_indices=True and available)
+        indices_tensor: torch.Tensor of shape (n_examples,) with example indices (if load_masks_and_indices=True and available)
     """
     # Load the NPZ file
     data = np.load(npz_path)
@@ -85,6 +93,24 @@ def load_npz_data(
         else:
             print("Warning: Features requested but not found in NPZ file")
 
+    # Load masks and indices if requested and available
+    inputs_mask: Optional[torch.Tensor] = None
+    outputs_mask: Optional[torch.Tensor] = None
+    indices_tensor: Optional[torch.Tensor] = None
+
+    if load_masks_and_indices:
+        if "inputs_mask" in data and "outputs_mask" in data:
+            inputs_mask = torch.from_numpy(data["inputs_mask"]).bool()
+            outputs_mask = torch.from_numpy(data["outputs_mask"]).bool()
+            print(
+                f"Loaded masks: inputs_mask={inputs_mask.shape}, outputs_mask={outputs_mask.shape}"
+            )
+        else:
+            print("Warning: Masks requested but not found in NPZ file")
+
+        # Convert indices to tensor
+        indices_tensor = torch.from_numpy(np.array(indices)).long()
+
     return (
         filenames,
         indices,
@@ -93,6 +119,9 @@ def load_npz_data(
         inputs_features,
         outputs_features,
         subset_example_index_is_train,
+        inputs_mask,
+        outputs_mask,
+        indices_tensor,
     )
 
 
@@ -274,7 +303,9 @@ def prepare_dataset(
         inputs_features,
         outputs_features,
         subset_is_train,
-    ) = load_npz_data(npz_path, use_features=use_features)
+    ) = load_npz_data(npz_path, use_features=use_features)[
+        :7
+    ]  # Take only first 7 elements
 
     # Apply subset filtering if requested
     if use_train_subset is not None:
@@ -434,6 +465,194 @@ def load_feature_data(
     )
 
 
+def load_feature_mapping_dataloader(
+    npz_path: str,
+    batch_size: int = 32,
+    shuffle: bool = True,
+    filename_filter: Optional[str] = None,
+    data_augment_factor: int = 1,
+    use_train_subset: Optional[bool] = None,
+) -> DataLoader[Any]:
+    """
+    Load feature mapping data from NPZ file with optional filename and subset filtering.
+
+    This function is designed to replace the load_feature_data functions in the main_mapping modules.
+    It loads features, masks, and indices in the format expected by feature mapping models.
+
+    Args:
+        npz_path: Path to NPZ file
+        batch_size: Batch size for DataLoader
+        shuffle: Whether to shuffle the data
+        filename_filter: Filter to specific filename (without .json extension)
+        data_augment_factor: Number of times to repeat the dataset per epoch
+        use_train_subset: If True, use only "train" subset; if False, use only "test" subset; if None, use all
+
+    Returns:
+        DataLoader with batches containing (input_features, output_features, inputs_mask, outputs_mask, indices, subset_is_train)
+    """
+    print(f"Loading feature mapping data from {npz_path}")
+
+    # Load all data including masks and indices
+    (
+        filenames,
+        _,
+        _,  # inputs (one-hot colors, not needed for feature mapping)
+        _,  # outputs (one-hot colors, not needed for feature mapping)
+        inputs_features,
+        outputs_features,
+        subset_is_train,
+        inputs_mask,
+        outputs_mask,
+        indices_tensor,
+    ) = load_npz_data(npz_path, use_features=True, load_masks_and_indices=True)
+
+    # Check that we have the required data
+    if inputs_features is None or outputs_features is None:
+        raise ValueError(
+            "Feature mapping requires features data, but it was not found in NPZ file"
+        )
+
+    if inputs_mask is None or outputs_mask is None:
+        raise ValueError(
+            "Feature mapping requires mask data, but it was not found in NPZ file"
+        )
+
+    if indices_tensor is None:
+        raise ValueError(
+            "Feature mapping requires indices data, but it was not found in NPZ file"
+        )
+
+    # Convert features to float if they aren't already
+    inputs_features = inputs_features.float()
+    outputs_features = outputs_features.float()
+
+    # Load subset information if available
+    subset_is_train_tensor = None
+    if subset_is_train is not None:
+        subset_is_train_tensor = torch.from_numpy(subset_is_train).bool()
+
+    # Apply filename filter if specified
+    if filename_filter is not None:
+        # Create mask for matching filenames (with .json extension)
+        filename_with_ext = f"{filename_filter}.json"
+        mask = np.array([fname == filename_with_ext for fname in filenames])
+        filter_indices = np.where(mask)[0]
+
+        if len(filter_indices) == 0:
+            print(f"  Warning: No examples found for filename: {filename_filter}")
+            # Return empty dataloader
+            empty_dataset = TensorDataset(
+                torch.empty(0, 30, 30, inputs_features.shape[-1]),
+                torch.empty(0, 30, 30, outputs_features.shape[-1]),
+                torch.empty(0, 30, 30, dtype=torch.bool),
+                torch.empty(0, 30, 30, dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.bool),  # subset_is_train
+            )
+            return DataLoader(empty_dataset, batch_size=batch_size)
+
+        # Filter all arrays
+        inputs_features = inputs_features[filter_indices]
+        outputs_features = outputs_features[filter_indices]
+        inputs_mask = inputs_mask[filter_indices]
+        outputs_mask = outputs_mask[filter_indices]
+        indices_tensor = indices_tensor[filter_indices]
+        if subset_is_train is not None:
+            subset_is_train = subset_is_train[filter_indices]
+            if subset_is_train_tensor is not None:
+                subset_is_train_tensor = subset_is_train_tensor[filter_indices]
+
+        print(f"  Filtered to filename: {filename_filter}")
+        print(f"  Found {len(filter_indices)} examples")
+
+    # Apply subset filtering if requested
+    if use_train_subset is not None and subset_is_train is not None:
+        # Create mask for the desired subset
+        if use_train_subset:
+            subset_mask = subset_is_train
+            subset_name = "train"
+        else:
+            subset_mask = ~subset_is_train
+            subset_name = "test"
+
+        # Find indices that match the subset
+        subset_indices = np.where(subset_mask)[0]
+
+        if len(subset_indices) == 0:
+            print(f"  Warning: No examples found in {subset_name} subset")
+            # Return empty dataloader
+            empty_dataset = TensorDataset(
+                torch.empty(0, 30, 30, inputs_features.shape[-1]),
+                torch.empty(0, 30, 30, outputs_features.shape[-1]),
+                torch.empty(0, 30, 30, dtype=torch.bool),
+                torch.empty(0, 30, 30, dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, dtype=torch.bool),  # subset_is_train
+            )
+            return DataLoader(empty_dataset, batch_size=batch_size)
+
+        # Filter to subset
+        inputs_features = inputs_features[subset_indices]
+        outputs_features = outputs_features[subset_indices]
+        inputs_mask = inputs_mask[subset_indices]
+        outputs_mask = outputs_mask[subset_indices]
+        indices_tensor = indices_tensor[subset_indices]
+        if subset_is_train_tensor is not None:
+            subset_is_train_tensor = subset_is_train_tensor[subset_indices]
+
+        print(f"  Filtered to {subset_name} subset: {len(subset_indices)} examples")
+
+    # Apply data augmentation by repeating the dataset
+    if data_augment_factor > 1:
+        inputs_features = inputs_features.repeat(data_augment_factor, 1, 1, 1)
+        outputs_features = outputs_features.repeat(data_augment_factor, 1, 1, 1)
+        inputs_mask = inputs_mask.repeat(data_augment_factor, 1, 1)
+        outputs_mask = outputs_mask.repeat(data_augment_factor, 1, 1)
+        indices_tensor = indices_tensor.repeat(data_augment_factor)
+        if subset_is_train_tensor is not None:
+            subset_is_train_tensor = subset_is_train_tensor.repeat(data_augment_factor)
+        print(
+            f"  Data augmented {data_augment_factor}x: {len(inputs_features)} total examples"
+        )
+
+    print(f"  Input features shape: {inputs_features.shape}")
+    print(f"  Output features shape: {outputs_features.shape}")
+    print(f"  Examples: {len(inputs_features)}")
+
+    # Create dataset
+    if subset_is_train_tensor is not None:
+        dataset = TensorDataset(
+            inputs_features,
+            outputs_features,
+            inputs_mask,
+            outputs_mask,
+            indices_tensor,
+            subset_is_train_tensor,
+        )
+    else:
+        # Create a dummy tensor for consistency
+        dummy_subset = torch.zeros(len(inputs_features), dtype=torch.bool)
+        dataset = TensorDataset(
+            inputs_features,
+            outputs_features,
+            inputs_mask,
+            outputs_mask,
+            indices_tensor,
+            dummy_subset,
+        )
+
+    # Create dataloader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return dataloader
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -470,7 +689,9 @@ if __name__ == "__main__":
         inputs_features,
         outputs_features,
         subset_is_train,
-    ) = load_npz_data(args.data_path, use_features=args.use_features)
+    ) = load_npz_data(args.data_path, use_features=args.use_features)[
+        :7
+    ]  # Take only first 7 elements
 
     # Print shape information
     print(f"Number of examples: {len(filenames)}")
