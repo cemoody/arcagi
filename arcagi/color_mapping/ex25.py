@@ -247,7 +247,8 @@ class OptimizedMemorizationModel(pl.LightningModule):
             h_messages = self.message_passing(h_temp)
 
             # Step 4: Residual connection with gradual increase
-            alpha = 0.3 + 0.1 * (i / max(1, noisy_steps))
+            # alpha = 0.3 + 0.1 * (i / max(1, noisy_steps))
+            alpha = 0.3
             h = h + alpha * h_messages
 
             # Step 5: Update x for next NCA iteration
@@ -265,7 +266,8 @@ class OptimizedMemorizationModel(pl.LightningModule):
             h_messages = self.message_passing(h_temp)
 
             # Step 4: Residual connection with gradual increase
-            alpha = 0.4 + 0.1 * (i / max(1, self.nca.num_final_steps))
+            # alpha = 0.4 + 0.1 * (i / max(1, self.nca.num_final_steps))
+            alpha = 0.3
             h = h + alpha * h_messages
 
             # Step 5: Update x for next NCA iteration (if not last step)
