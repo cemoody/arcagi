@@ -677,13 +677,31 @@ class SpatialMessagePassing(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # Simple 3x3 convolution for message passing
-        self.conv = nn.Conv2d(
+        # Ensure groups is valid (must divide hidden_dim evenly)
+        groups = min(hidden_dim // 16, hidden_dim) if hidden_dim >= 16 else 1
+        groups = max(1, groups)  # Ensure at least 1 group
+
+        # Simple 5x5 convolution for message passing
+        self.convq = nn.Conv2d(
             hidden_dim,
             hidden_dim,
-            kernel_size=3,
-            padding=1,
-            groups=hidden_dim // 16,  # Group convolution for efficiency
+            kernel_size=5,
+            padding=2,
+            groups=groups,  # Safe group convolution
+        )
+        self.convk = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=5,
+            padding=2,
+            groups=groups,  # Safe group convolution
+        )
+        self.convv = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=5,
+            padding=2,
+            groups=groups,  # Safe group convolution
         )
 
         self.norm = nn.LayerNorm(hidden_dim)
@@ -695,17 +713,68 @@ class SpatialMessagePassing(nn.Module):
         # Convert to conv format
         h_conv = h.permute(0, 3, 1, 2)  # [B, hidden_dim, 30, 30]
 
-        # Message passing
-        messages = self.conv(h_conv)
+        # Message passing - compute Q, K, V
+        messages_q = self.convq(h_conv)  # [B, hidden_dim, 30, 30]
+        messages_k = self.convk(h_conv)  # [B, hidden_dim, 30, 30]
+        messages_v = self.convv(h_conv)  # [B, hidden_dim, 30, 30]
 
-        messages = messages.permute(0, 2, 3, 1)  # [B, 30, 30, hidden_dim]
+        # Convert back to spatial format for attention computation
+        q = messages_q.permute(0, 2, 3, 1)  # [B, 30, 30, hidden_dim]
+        k = messages_k.permute(0, 2, 3, 1)  # [B, 30, 30, hidden_dim]
+        v = messages_v.permute(0, 2, 3, 1)  # [B, 30, 30, hidden_dim]
 
-        # Apply layer norm and activation
-        messages = self.norm(messages)
-        messages = self.activation(messages)
-        messages = self.dropout(messages)
+        B, H, W, D = q.shape
 
-        return messages
+        # Pad k and v for neighbor access (2 pixels on each side for 5x5 neighborhood)
+        k_padded = F.pad(
+            k, (0, 0, 2, 2, 2, 2), mode="constant", value=0
+        )  # [B, 34, 34, D]
+        v_padded = F.pad(
+            v, (0, 0, 2, 2, 2, 2), mode="constant", value=0
+        )  # [B, 34, 34, D]
+
+        # Use unfold to extract all 5x5 neighborhoods efficiently
+        # Unfold extracts sliding windows - much faster than loops!
+        k_unfolded = (
+            k_padded.permute(0, 3, 1, 2).unfold(2, 5, 1).unfold(3, 5, 1)
+        )  # [B, D, 30, 30, 5, 5]
+        v_unfolded = (
+            v_padded.permute(0, 3, 1, 2).unfold(2, 5, 1).unfold(3, 5, 1)
+        )  # [B, D, 30, 30, 5, 5]
+
+        # Reshape to get all neighbors: [B, D, 30, 30, 25]
+        k_neighbors = k_unfolded.reshape(B, D, H, W, 25)  # [B, D, 30, 30, 25]
+        v_neighbors = v_unfolded.reshape(B, D, H, W, 25)  # [B, D, 30, 30, 25]
+
+        # Permute back to spatial-last format: [B, 30, 30, D, 25]
+        k_neighbors = k_neighbors.permute(0, 2, 3, 1, 4)  # [B, 30, 30, D, 25]
+        v_neighbors = v_neighbors.permute(0, 2, 3, 1, 4)  # [B, 30, 30, D, 25]
+
+        # Compute attention scores efficiently using einsum
+        # q: [B, 30, 30, D], k_neighbors: [B, 30, 30, D, 25]
+        attention_scores = torch.einsum(
+            "bhwc,bhwcn->bhwn", q, k_neighbors
+        )  # [B, 30, 30, 25]
+
+        # Scale attention scores for stability (temperature scaling)
+        attention_scores = attention_scores / (D**0.5)
+
+        # Apply softmax over neighbors (last dimension)
+        attention_weights = F.softmax(attention_scores, dim=-1)  # [B, 30, 30, 25]
+
+        # Apply attention weights to values using einsum
+        # attention_weights: [B, 30, 30, 25], v_neighbors: [B, 30, 30, D, 25]
+        messages = torch.einsum(
+            "bhwn,bhwcn->bhwc", attention_weights, v_neighbors
+        )  # [B, 30, 30, D]
+
+        # Residual connection + layer norm and activation
+        output = h + messages  # Residual connection is crucial!
+        output = self.norm(output)
+        output = self.activation(output)
+        output = self.dropout(output)
+
+        return output
 
 
 def run_visualization(args: argparse.Namespace) -> None:
