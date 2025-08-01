@@ -275,8 +275,15 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Final projection
         h = h + self.linear_2(x)
 
-        # Global context computation removed to reduce parameters
-        # Sequential NCA+MP processing should provide sufficient spatial context
+        # Global context
+        h_spatial = h.permute(0, 3, 1, 2).contiguous()  # [B, hidden_dim, 30, 30]
+        global_context = (
+            self.global_pool(h_spatial).squeeze(-1).squeeze(-1)
+        )  # [B, hidden_dim]
+        global_context = self.global_transform(global_context)  # [B, hidden_dim]
+
+        # Add global context back
+        h = h + global_context.unsqueeze(1).unsqueeze(2) * 0.1
 
         # Color-specific predictions
         logits_list: List[torch.Tensor] = []

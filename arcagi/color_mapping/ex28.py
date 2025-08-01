@@ -5,17 +5,17 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
-from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our visualization tools
+# Import data loading functions
+from data_loader import create_dataloader, prepare_dataset
 from utils.terminal_imshow import imshow
 
 
@@ -319,16 +319,33 @@ class OptimizedMemorizationModel(pl.LightningModule):
     def training_step(
         self, batch: Tuple[torch.Tensor, ...], batch_idx: int
     ) -> torch.Tensor:
-        (
-            input_features,
-            output_features,
-            input_colors,
-            output_colors,
-            input_masks,
-            output_masks,
-            _,
-            _,
-        ) = batch
+        # Handle new data_loader.py format: (inputs, outputs, inputs_features, outputs_features)
+        if len(batch) == 4:
+            inputs_one_hot, outputs_one_hot, input_features, output_features = batch
+            # Ensure features are float tensors for MPS compatibility
+            input_features = input_features.float()
+            output_features = output_features.float()
+            # Extract colors and masks from the grid data
+            input_colors = inputs_one_hot.argmax(dim=-1).long()
+            output_colors = outputs_one_hot.argmax(dim=-1).long()
+            # Change any colors >= 10 to -1 (mask)
+            input_colors = torch.where(input_colors >= 10, -1, input_colors)
+            output_colors = torch.where(output_colors >= 10, -1, output_colors)
+            input_masks = input_colors >= 0
+            output_masks = output_colors >= 0
+
+        else:
+            # Legacy format for backward compatibility
+            (
+                input_features,
+                output_features,
+                input_colors,
+                output_colors,
+                input_masks,
+                output_masks,
+                _,
+                _,
+            ) = batch
 
         # Get example indices for this batch
         example_indices = (
@@ -494,8 +511,6 @@ class OptimizedMemorizationModel(pl.LightningModule):
                     output_color_logits[i : i + 1],
                     "output",
                 )
-
-        breakpoint()
         return total_loss
 
     def on_train_epoch_end(self) -> None:
@@ -551,16 +566,35 @@ class OptimizedMemorizationModel(pl.LightningModule):
     def validation_step(
         self, batch: Tuple[torch.Tensor, ...], batch_idx: int
     ) -> Dict[str, torch.Tensor]:
-        (
-            input_features,
-            output_features,
-            input_colors,
-            output_colors,
-            input_masks,
-            output_masks,
-            example_indices,
-            _,
-        ) = batch
+        # Handle new data_loader.py format: (inputs, outputs, inputs_features, outputs_features)
+        if len(batch) == 4:
+            inputs_one_hot, outputs_one_hot, input_features, output_features = batch
+
+            input_features = input_features.float()
+            output_features = output_features.float()
+            # Extract colors and masks from the grid data
+            input_colors = inputs_one_hot.argmax(dim=-1).long()
+            output_colors = outputs_one_hot.argmax(dim=-1).long()
+            # Change any colors >= 10 to -1 (mask)
+            input_colors = torch.where(input_colors >= 10, -1, input_colors)
+            output_colors = torch.where(output_colors >= 10, -1, output_colors)
+            input_masks = input_colors >= 0
+            output_masks = output_colors >= 0
+
+            # For validation, we don't need example indices - use simple range
+            example_indices = torch.arange(len(input_features), device=self.device)
+        else:
+            # Legacy format for backward compatibility
+            (
+                input_features,
+                output_features,
+                input_colors,
+                output_colors,
+                input_masks,
+                output_masks,
+                example_indices,
+                _,
+            ) = batch
 
         # For validation, we don't use example indices
         input_color_logits, input_mask_logits = self(input_features)
@@ -1304,83 +1338,7 @@ class PerfectAccuracyEarlyStopping(Callback):
             self.best_epoch = -1
 
 
-def load_single_file_data(
-    filename: str, data_dir: str = "/tmp/arc_data", subset: Optional[str] = None
-) -> Tuple[TensorDataset, List[int]]:
-    """Load data for a single filename with optional subset filtering.
-
-    Args:
-        filename: The filename to load (without .json extension)
-        data_dir: Directory containing the data
-        subset: 'train' or 'test' to filter by subset, None for all
-
-    Returns:
-        dataset: TensorDataset with the loaded data
-        available_colors: List of unique color indices found in the data
-    """
-    # Load preprocessed data
-    train_data = np.load("processed_data/train_all.npz")
-
-    # Get indices for this filename
-    filenames = train_data["filenames"]
-    file_indices = np.where(filenames == filename + ".json")[0]
-
-    if len(file_indices) == 0:
-        raise ValueError(f"No training examples found for {filename}")
-
-    # Apply subset filtering if requested
-    if subset is not None and "subset_example_index_is_train" in train_data:
-        subset_is_train = train_data["subset_example_index_is_train"][file_indices]
-        if subset == "train":
-            subset_mask = subset_is_train
-        else:  # test
-            subset_mask = ~subset_is_train
-
-        file_indices = file_indices[subset_mask]
-
-        if len(file_indices) == 0:
-            raise ValueError(f"No {subset} examples found for {filename}")
-
-    subset_name = f" {subset}" if subset else ""
-    print(f"Found {len(file_indices)}{subset_name} examples for {filename}")
-
-    # Extract features and colors
-    input_features = torch.from_numpy(
-        train_data["inputs_features"][file_indices]
-    ).float()
-    output_features = torch.from_numpy(
-        train_data["outputs_features"][file_indices]
-    ).float()
-    input_colors = torch.from_numpy(train_data["inputs"][file_indices]).long()
-    output_colors = torch.from_numpy(train_data["outputs"][file_indices]).long()
-
-    # Extract masks
-    input_masks = torch.from_numpy(train_data["inputs_mask"][file_indices]).bool()
-    output_masks = torch.from_numpy(train_data["outputs_mask"][file_indices]).bool()
-
-    # Extract example indices (the index within the file)
-    example_indices = torch.from_numpy(train_data["indices"][file_indices]).long()
-
-    # Get available colors
-    all_colors = torch.cat([input_colors.flatten(), output_colors.flatten()])
-    available_colors = torch.unique(all_colors[all_colors != -1]).tolist()
-
-    print(f"Available colors for {filename}: {available_colors}")
-    print(f"Example indices: {example_indices.tolist()}")
-
-    # Create dataset
-    dataset = TensorDataset(
-        input_features,
-        output_features,
-        input_colors,
-        output_colors,
-        input_masks,
-        output_masks,
-        example_indices,  # Use actual example indices
-        torch.zeros(len(file_indices)),  # Dummy
-    )
-
-    return dataset, available_colors
+# Custom dataloader removed - now using data_loader.py functions
 
 
 def main():
@@ -1494,29 +1452,121 @@ def main():
         print(f"Training on 'train' subset of {filename}")
         print(f"Evaluating on 'test' subset of {filename}")
 
-        # Load train and test subsets separately
-        train_dataset, available_colors = load_single_file_data(
-            filename, args.data_dir, subset="train"
+        # Load train subset using data_loader.py
+        train_inputs, train_outputs, train_input_features, train_output_features = (
+            prepare_dataset(
+                "processed_data/train_all.npz",
+                filter_filename=f"{filename}.json",
+                use_features=True,
+                dataset_name="train",
+                use_train_subset=True,
+            )
         )
-        test_dataset, _ = load_single_file_data(filename, args.data_dir, subset="test")
 
-        # Create dataloaders
-        train_loader = DataLoader(
-            train_dataset, batch_size=len(train_dataset), shuffle=True
+        # Load test subset using data_loader.py
+        test_inputs, test_outputs, test_input_features, test_output_features = (
+            prepare_dataset(
+                "processed_data/train_all.npz",
+                filter_filename=f"{filename}.json",
+                use_features=True,
+                dataset_name="test",
+                use_train_subset=False,
+            )
         )
-        val_loader = DataLoader(
-            test_dataset, batch_size=len(test_dataset), shuffle=False
+
+        # Get available colors from training data
+        # Convert one-hot encoded tensors back to color indices
+        train_input_colors = train_inputs.argmax(dim=-1)  # [B, 30, 30]
+        train_output_colors = train_outputs.argmax(dim=-1)  # [B, 30, 30]
+
+        # Handle mask: if max value is at index 10, it means masked (-1)
+        train_input_colors = torch.where(
+            train_input_colors == 10, -1, train_input_colors
         )
-        test_loader = DataLoader(
-            test_dataset, batch_size=len(test_dataset), shuffle=False
+        train_output_colors = torch.where(
+            train_output_colors == 10, -1, train_output_colors
+        )
+
+        all_colors = torch.cat(
+            [train_input_colors.flatten(), train_output_colors.flatten()]
+        )
+        available_colors = torch.unique(all_colors[all_colors != -1]).tolist()
+        print(f"Available colors for {filename}: {available_colors}")
+
+        # Create dataloaders using data_loader.py
+        train_loader = create_dataloader(
+            train_inputs,
+            train_outputs,
+            batch_size=len(train_inputs),
+            shuffle=True,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=train_input_features,
+            outputs_features=train_output_features,
+        )
+        val_loader = create_dataloader(
+            test_inputs,
+            test_outputs,
+            batch_size=len(test_inputs),
+            shuffle=False,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=test_input_features,
+            outputs_features=test_output_features,
+        )
+        test_loader = create_dataloader(
+            test_inputs,
+            test_outputs,
+            batch_size=len(test_inputs),
+            shuffle=False,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=test_input_features,
+            outputs_features=test_output_features,
         )
     else:
-        # Load all data (no subset filtering)
-        train_dataset, available_colors = load_single_file_data(filename, args.data_dir)
+        # Load all data (no subset filtering) using data_loader.py
+        all_inputs, all_outputs, all_input_features, all_output_features = (
+            prepare_dataset(
+                "processed_data/train_all.npz",
+                filter_filename=f"{filename}.json",
+                use_features=True,
+                dataset_name="all",
+                use_train_subset=None,
+            )
+        )
 
-        # Create dataloaders
-        train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-        val_loader = DataLoader(train_dataset, batch_size=2, shuffle=False)
+        # Get available colors
+        # Convert one-hot encoded tensors back to color indices
+        all_input_colors = all_inputs.argmax(dim=-1)  # [B, 30, 30]
+        all_output_colors = all_outputs.argmax(dim=-1)  # [B, 30, 30]
+
+        # Handle mask: if max value is at index 10, it means masked (-1)
+        all_input_colors = torch.where(all_input_colors == 10, -1, all_input_colors)
+        all_output_colors = torch.where(all_output_colors == 10, -1, all_output_colors)
+
+        all_colors = torch.cat(
+            [all_input_colors.flatten(), all_output_colors.flatten()]
+        )
+        available_colors = torch.unique(all_colors[all_colors != -1]).tolist()
+        print(f"Available colors for {filename}: {available_colors}")
+
+        # Create dataloaders using data_loader.py
+        train_loader = create_dataloader(
+            all_inputs,
+            all_outputs,
+            batch_size=2,
+            shuffle=True,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=all_input_features,
+            outputs_features=all_output_features,
+        )
+        val_loader = create_dataloader(
+            all_inputs,
+            all_outputs,
+            batch_size=2,
+            shuffle=False,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=all_input_features,
+            outputs_features=all_output_features,
+        )
         test_loader = None
 
     # Create model
@@ -1530,7 +1580,9 @@ def main():
         weight_decay=args.weight_decay,
         temperature=args.temperature,
         filename=filename,
-        num_train_examples=len(train_dataset),
+        num_train_examples=(
+            len(train_inputs) if args.single_file_mode else len(all_inputs)
+        ),
         # Self-healing noise parameters
         enable_self_healing=args.enable_self_healing,
         death_prob=args.death_prob,
@@ -1599,16 +1651,34 @@ def main():
         model.eval()
         with torch.no_grad():
             for batch in test_loader:
-                (
-                    input_features,
-                    output_features,
-                    input_colors,
-                    output_colors,
-                    input_masks,
-                    output_masks,
-                    _,
-                    _,
-                ) = batch
+                # Handle new data_loader.py format: (inputs, outputs, inputs_features, outputs_features)
+                if len(batch) == 4:
+                    inputs_one_hot, outputs_one_hot, input_features, output_features = (
+                        batch
+                    )
+                    # Ensure features are float tensors for MPS compatibility
+                    input_features = input_features.float()
+                    output_features = output_features.float()
+                    # Extract colors and masks from the grid data
+                    input_colors = inputs_one_hot.argmax(dim=-1).long()
+                    output_colors = outputs_one_hot.argmax(dim=-1).long()
+                    # Change any colors >= 10 to -1 (mask)
+                    input_colors = torch.where(input_colors >= 10, -1, input_colors)
+                    output_colors = torch.where(output_colors >= 10, -1, output_colors)
+                    input_masks = input_colors >= 0
+                    output_masks = output_colors >= 0
+                else:
+                    # Legacy format for backward compatibility
+                    (
+                        input_features,
+                        output_features,
+                        input_colors,
+                        output_colors,
+                        input_masks,
+                        output_masks,
+                        _,
+                        _,
+                    ) = batch
 
                 # Get predictions
                 input_color_logits, input_mask_logits = model(input_features)
