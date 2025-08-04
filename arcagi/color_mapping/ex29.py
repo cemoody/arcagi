@@ -3,7 +3,8 @@ import os
 
 # Import from parent module
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -17,6 +18,204 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import data loading functions
 from data_loader import create_dataloader, prepare_dataset
 from utils.terminal_imshow import imshow
+
+
+def apply_binary_noise(
+    features: torch.Tensor, noise_prob: float, training: bool
+) -> torch.Tensor:
+    """Apply binary noise to features during training only."""
+    if training and noise_prob > 0:
+        # Create noise mask with probability noise_prob
+        noise_mask = torch.rand_like(features) < noise_prob
+
+        # For binary features (0/1), flip them
+        # For continuous features, add small random perturbation
+        binary_features = (features == 0) | (features == 1)
+
+        # Flip binary features
+        features = torch.where(
+            noise_mask & binary_features, 1 - features, features  # Flip 0->1, 1->0
+        )
+
+        # Add small noise to continuous features
+        continuous_noise = torch.randn_like(features) * 0.01
+        features = torch.where(
+            noise_mask & ~binary_features, features + continuous_noise, features
+        )
+
+    return features
+
+
+def apply_color_constraints(
+    logits: torch.Tensor,
+    available_colors: torch.Tensor | None = None,
+    num_classes: int = 10,
+) -> torch.Tensor:
+    """Apply hard constraints to ensure only available colors are predicted."""
+    if available_colors is not None:
+
+        # Assert that available_colors contains integer types
+        assert available_colors.dtype in [
+            torch.int,
+            torch.long,
+            torch.int32,
+            torch.int64,
+        ], f"available_colors must have integer dtype, got {available_colors.dtype}"
+        # Check max color is within valid range
+        max_color = available_colors.max() if available_colors else -1
+        assert (
+            max_color < num_classes
+        ), f"Maximum color index {max_color} must be less than num_classes {num_classes}"
+        mask = torch.ones(num_classes, device=logits.device) * -1e10
+        mask[available_colors] = 0
+        logits = logits + mask.unsqueeze(0).unsqueeze(1).unsqueeze(2)
+    return logits
+
+
+@dataclass
+class Batch:
+    """Dataclass to hold output batch data with proper typing."""
+
+    one: torch.Tensor  # one hot [B, 30, 30, 10]
+    fea: torch.Tensor  # order2 features [B, 30, 30, 147]
+    col: torch.Tensor  # colors, int array [B, 30, 30]
+    msk: torch.Tensor  # masks, bool array [B, 30, 30]
+    colf: torch.Tensor  # colors, flattened [B, 30*30]
+    mskf: torch.Tensor  # masks, flattened [B, 30*30]
+
+
+@dataclass
+class BatchData:
+    """Dataclass to hold complete batch data with proper typing."""
+
+    inp: Batch
+    out: Batch
+
+
+def batch_to_dataclass(
+    batch: Tuple[torch.Tensor, ...],
+) -> BatchData:
+    inputs_one_hot, outputs_one_hot, input_features, output_features = batch
+
+    # Ensure features are float tensors for MPS compatibility
+    input_features = input_features.float()
+    output_features = output_features.float()
+
+    # Extract colors and masks from the grid data
+    input_colors = inputs_one_hot.argmax(dim=-1).long()
+    output_colors = outputs_one_hot.argmax(dim=-1).long()
+
+    # Change any colors >= 10 to -1 (mask)
+    input_colors = torch.where(input_colors >= 10, -1, input_colors)
+    output_colors = torch.where(output_colors >= 10, -1, output_colors)
+
+    # Create masks (True where valid colors exist)
+    input_masks = input_colors >= 0
+    output_masks = output_colors >= 0
+
+    # Get example indices for this batch
+    input_colors_flat = input_colors.reshape(-1)
+    output_colors_flat = output_colors.reshape(-1)
+    input_masks_flat = input_masks.reshape(-1)
+    output_masks_flat = output_masks.reshape(-1)
+
+    inp = Batch(
+        one=inputs_one_hot,
+        fea=input_features,
+        col=input_colors,
+        msk=input_masks,
+        colf=input_colors_flat,
+        mskf=input_masks_flat.float(),
+    )
+
+    out = Batch(
+        one=outputs_one_hot,
+        fea=output_features,
+        col=output_colors,
+        msk=output_masks,
+        colf=output_colors_flat,
+        mskf=output_masks_flat.float(),
+    )
+
+    return BatchData(inp=inp, out=out)
+
+
+def color_accuracy(
+    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    predictions = logits.argmax(dim=-1)
+    return (predictions[valid_mask] == targets[valid_mask]).float().mean()
+
+
+def mask_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    predictions = (logits > 0).float()
+    return (predictions == targets.float()).float().mean()
+
+
+def training_index_metrics(
+    i: BatchData,
+    col_log: torch.Tensor,
+    msk_log: torch.Tensor,
+    prefix: str,
+    metrics_dict: Dict[int, Dict[str, int]],
+) -> Dict[int, Dict[str, int]]:
+    # For every index in the batch, compute the metrics:
+    # Compute total number of actiev pixels not-masked
+    # Compute number of correct color pixels
+    # Compute number of correct mask pixels
+
+    # Get predictions
+    col_pred = col_log.argmax(dim=-1)  # [B, 30, 30]
+    msk_pred = (msk_log > 0).squeeze(-1)  # [B, 30, 30]
+
+    pixels_per_index = i.inp.mskf.sum(dim=-1)  # [B]
+    pixels_incorrect = (col_pred != i.inp.col) | (msk_pred != i.inp.msk)
+    pixels_incorrect_sum = pixels_incorrect.sum(dim=-1).sum(dim=-1)
+
+    for idx in range(i.inp.col.shape[0]):
+        metrics_dict[idx] = {
+            f"{prefix}pixels_per_index": int(pixels_per_index[idx]),
+            f"{prefix}pixels_incorrect": int(pixels_incorrect_sum[idx]),
+        }
+    breakpoint()
+
+    return metrics_dict
+
+
+def create_sinusoidal_embeddings(hidden_dim: int) -> torch.Tensor:
+    """Create sinusoidal position embeddings for a 30x30 grid."""
+    import math
+
+    # Create position indices for x and y
+    x_pos = torch.arange(30).float()
+    y_pos = torch.arange(30).float()
+
+    # Create 2D grid of positions
+    grid_x, grid_y = torch.meshgrid(x_pos, y_pos, indexing="ij")
+
+    # Initialize embedding tensor
+    pos_embed = torch.zeros(30, 30, hidden_dim)
+
+    # Half dimensions for x, half for y
+    half_dim = hidden_dim // 2
+
+    # Create div_term for frequency scaling
+    div_term_x = torch.exp(
+        torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
+    )
+    div_term_y = torch.exp(
+        torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
+    )
+
+    # Apply sinusoidal functions to x coordinates
+    pos_embed[:, :, 0:half_dim:2] = torch.sin(grid_x.unsqueeze(-1) * div_term_x)
+    pos_embed[:, :, 1:half_dim:2] = torch.cos(grid_x.unsqueeze(-1) * div_term_x)
+
+    # Apply sinusoidal functions to y coordinates
+    pos_embed[:, :, half_dim::2] = torch.sin(grid_y.unsqueeze(-1) * div_term_y)
+    pos_embed[:, :, half_dim + 1 :: 2] = torch.cos(grid_y.unsqueeze(-1) * div_term_y)
+
+    return pos_embed
 
 
 class OptimizedMemorizationModel(pl.LightningModule):
@@ -36,6 +235,9 @@ class OptimizedMemorizationModel(pl.LightningModule):
     8. Dual prediction heads for colors and masks
     9. Emergent spatial patterns through cellular automata
     """
+
+    training_index_metrics: Dict[int, Dict[str, int]] = {}
+    validation_index_metrics: Dict[int, Dict[str, int]] = {}
 
     def __init__(
         self,
@@ -95,9 +297,7 @@ class OptimizedMemorizationModel(pl.LightningModule):
 
         # Sinusoidal position embeddings - no parameters needed
         # Pre-compute the position embeddings for efficiency
-        self.register_buffer(
-            "pos_embed", self._create_sinusoidal_embeddings(hidden_dim)
-        )
+        self.register_buffer("pos_embed", create_sinusoidal_embeddings(hidden_dim))
 
         self.linear_1 = nn.Linear(hidden_dim, dim_nca)
         self.linear_2 = nn.Linear(dim_nca, hidden_dim)
@@ -133,94 +333,25 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Better initialization
         self._init_weights()
 
-    def apply_binary_noise(self, features: torch.Tensor) -> torch.Tensor:
-        """Apply binary noise to features during training only."""
-        if self.training and self.noise_prob > 0:
-            # Create noise mask with probability noise_prob
-            noise_mask = torch.rand_like(features) < self.noise_prob
-
-            # For binary features (0/1), flip them
-            # For continuous features, add small random perturbation
-            binary_features = (features == 0) | (features == 1)
-
-            # Flip binary features
-            features = torch.where(
-                noise_mask & binary_features, 1 - features, features  # Flip 0->1, 1->0
-            )
-
-            # Add small noise to continuous features
-            continuous_noise = torch.randn_like(features) * 0.01
-            features = torch.where(
-                noise_mask & ~binary_features, features + continuous_noise, features
-            )
-
-        return features
-
-    def _create_sinusoidal_embeddings(self, hidden_dim: int) -> torch.Tensor:
-        """Create sinusoidal position embeddings for a 30x30 grid."""
-        import math
-
-        # Create position indices for x and y
-        x_pos = torch.arange(30).float()
-        y_pos = torch.arange(30).float()
-
-        # Create 2D grid of positions
-        grid_x, grid_y = torch.meshgrid(x_pos, y_pos, indexing="ij")
-
-        # Initialize embedding tensor
-        pos_embed = torch.zeros(30, 30, hidden_dim)
-
-        # Half dimensions for x, half for y
-        half_dim = hidden_dim // 2
-
-        # Create div_term for frequency scaling
-        div_term_x = torch.exp(
-            torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
-        )
-        div_term_y = torch.exp(
-            torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim)
-        )
-
-        # Apply sinusoidal functions to x coordinates
-        pos_embed[:, :, 0:half_dim:2] = torch.sin(grid_x.unsqueeze(-1) * div_term_x)
-        pos_embed[:, :, 1:half_dim:2] = torch.cos(grid_x.unsqueeze(-1) * div_term_x)
-
-        # Apply sinusoidal functions to y coordinates
-        pos_embed[:, :, half_dim::2] = torch.sin(grid_y.unsqueeze(-1) * div_term_y)
-        pos_embed[:, :, half_dim + 1 :: 2] = torch.cos(
-            grid_y.unsqueeze(-1) * div_term_y
-        )
-
-        return pos_embed
-
     def _init_weights(self):
         """Initialize weights with Xavier/He initialization."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(
-        self, features: torch.Tensor, example_idx: Optional[torch.Tensor] = None
+        self,
+        features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass to predict both colors and masks.
-
-        Args:
-            features: Input features of shape [B, 30, 30, feature_dim]
-            example_idx: Optional example indices for example-aware processing
-
-        Returns:
-            color_logits: Color predictions of shape [B, 30, 30, num_classes]
-            mask_logits: Mask predictions of shape [B, 30, 30, 1]
-        """
         # Apply binary noise during training
-        features = self.apply_binary_noise(features)
+        features = apply_binary_noise(
+            features, noise_prob=self.noise_prob, training=self.training
+        )
 
         # Extract base features
         h = self.feature_extractor(features)  # [B, 30, 30, hidden_dim]
@@ -289,689 +420,103 @@ class OptimizedMemorizationModel(pl.LightningModule):
         color_logits = color_logits / self.temperature
 
         # Apply color constraints
-        color_logits = self.apply_color_constraints(color_logits)
+        color_logits = apply_color_constraints(color_logits, self.available_colors)
 
         # Mask prediction
         mask_logits = self.mask_head(h)  # [B, 30, 30, 1]
 
         return color_logits, mask_logits
 
-    def apply_color_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        """Apply hard constraints to ensure only available colors are predicted."""
-        if self.available_colors is not None:
-            mask = torch.ones(self.num_classes, device=logits.device) * -1e10
-            mask[self.available_colors] = 0
-            logits = logits + mask.unsqueeze(0).unsqueeze(1).unsqueeze(2)
-        return logits
-
-    def predict_colors(self, features: torch.Tensor) -> torch.Tensor:
-        """Predict colors from features. Returns color indices."""
-        with torch.no_grad():
-            color_logits, _ = self(features)
-            return color_logits.argmax(dim=-1)
-
-    def predict_masks(self, features: torch.Tensor) -> torch.Tensor:
-        """Predict masks from features. Returns binary mask."""
-        with torch.no_grad():
-            _, mask_logits = self(features)
-            return (mask_logits > 0).squeeze(-1)
-
     def training_step(
         self, batch: Tuple[torch.Tensor, ...], batch_idx: int
     ) -> torch.Tensor:
-        # Handle new data_loader.py format: (inputs, outputs, inputs_features, outputs_features)
-        if len(batch) == 4:
-            inputs_one_hot, outputs_one_hot, input_features, output_features = batch
-            # Ensure features are float tensors for MPS compatibility
-            input_features = input_features.float()
-            output_features = output_features.float()
-            # Extract colors and masks from the grid data
-            input_colors = inputs_one_hot.argmax(dim=-1).long()
-            output_colors = outputs_one_hot.argmax(dim=-1).long()
-            # Change any colors >= 10 to -1 (mask)
-            input_colors = torch.where(input_colors >= 10, -1, input_colors)
-            output_colors = torch.where(output_colors >= 10, -1, output_colors)
-            input_masks = input_colors >= 0
-            output_masks = output_colors >= 0
+        return self.step(batch, batch_idx, step_type="train")
 
+    def validation_step(
+        self, batch: Tuple[torch.Tensor, ...], batch_idx: int
+    ) -> torch.Tensor:
+        return self.step(batch, batch_idx, step_type="val")
+
+    def step(
+        self,
+        batch: Tuple[torch.Tensor, ...],
+        batch_idx: int,
+        step_type: Literal["train", "val"] = "train",
+    ) -> torch.Tensor:
+        i = batch_to_dataclass(batch)
+
+        # Compute losses for order2->color
+        # for (input/output) x (colors/masks)
+        losses: List[torch.Tensor] = []
+        metrics: Dict[int, Dict[str, int]] = {}
+        for prefix, ex in [("input", i.inp), ("output", i.out)]:
+            col_log, msk_log = self(ex.fea)
+            col_logf = col_log.reshape(-1, col_log.size(-1))
+            col_loss = F.cross_entropy(col_logf, ex.colf)
+            msk_logf = msk_log.reshape(-1)
+            msk_loss = F.binary_cross_entropy_with_logits(msk_logf, ex.mskf)
+            losses.append(col_loss + msk_loss)
+            training_index_metrics(i, col_log, msk_log, prefix, metrics)
+        if step_type == "train":
+            self.training_index_metrics = metrics
         else:
-            # Legacy format for backward compatibility
-            (
-                input_features,
-                output_features,
-                input_colors,
-                output_colors,
-                input_masks,
-                output_masks,
-                _,
-                _,
-            ) = batch
-
-        # Get example indices for this batch
-        example_indices = (
-            torch.arange(len(input_features), device=self.device)
-            % self.num_train_examples
-        )
-
-        # Process inputs with example information
-        input_color_logits, input_mask_logits = self(input_features, example_indices)
-
-        # Color loss for inputs
-        input_color_loss = F.cross_entropy(
-            input_color_logits.reshape(-1, input_color_logits.size(-1)),
-            input_colors.reshape(-1),
-        )
-
-        # Mask loss for inputs (binary cross entropy)
-        input_mask_loss = F.binary_cross_entropy_with_logits(
-            input_mask_logits.reshape(-1), input_masks.reshape(-1).float()
-        )
-
-        # Process outputs with example information
-        output_color_logits, output_mask_logits = self(output_features, example_indices)
-
-        # Color loss for outputs
-        output_color_loss = F.cross_entropy(
-            output_color_logits.reshape(-1, output_color_logits.size(-1)),
-            output_colors.reshape(-1),
-        )
-
-        # Mask loss for outputs (binary cross entropy)
-        output_mask_loss = F.binary_cross_entropy_with_logits(
-            output_mask_logits.reshape(-1), output_masks.reshape(-1).float()
-        )
+            self.validation_index_metrics = metrics
 
         # Combined loss
-        total_loss = (
-            input_color_loss + output_color_loss + input_mask_loss + output_mask_loss
-        )
+        total_loss = losses[0] + losses[1]
 
-        # Calculate color accuracy
-        all_color_logits = torch.cat(
-            [input_color_logits.flatten(0, 2), output_color_logits.flatten(0, 2)]
-        )
-        all_color_targets = torch.cat([input_colors.flatten(), output_colors.flatten()])
-        color_predictions = all_color_logits.argmax(dim=-1)
-
-        valid_color_mask = all_color_targets != -1
-        if valid_color_mask.any():
-            color_accuracy = (
-                (
-                    color_predictions[valid_color_mask]
-                    == all_color_targets[valid_color_mask]
-                )
-                .float()
-                .mean()
-            )
-        else:
-            color_accuracy = torch.tensor(0.0)
-
-        # Calculate mask accuracy
-        all_mask_logits = torch.cat(
-            [input_mask_logits.flatten(), output_mask_logits.flatten()]
-        )
-        all_mask_targets = torch.cat([input_masks.flatten(), output_masks.flatten()])
-        mask_predictions = (all_mask_logits > 0).float()
-
-        mask_accuracy = (mask_predictions == all_mask_targets.float()).float().mean()
-
-        self.log("train_loss", total_loss)
-        self.log("train_color_acc", color_accuracy)
-        self.log("train_mask_acc", mask_accuracy)
-
-        # Track per-index training metrics
-        for i in range(len(input_features)):
-            idx = example_indices[i].item()
-
-            # Calculate input color accuracy for this example
-            input_color_valid_mask_i = input_colors[i] != -1
-            input_color_correct_pixels = 0
-            input_color_valid_pixels = input_color_valid_mask_i.sum().item()
-            if input_color_valid_pixels > 0:
-                input_color_predictions_i = input_color_logits[i].argmax(dim=-1)
-                input_color_correct_pixels = (
-                    (
-                        input_color_predictions_i[input_color_valid_mask_i]
-                        == input_colors[i][input_color_valid_mask_i]
-                    )
-                    .sum()
-                    .item()
-                )
-
-            # Calculate output color accuracy for this example
-            output_color_valid_mask_i = output_colors[i] != -1
-            output_color_correct_pixels = 0
-            output_color_valid_pixels = output_color_valid_mask_i.sum().item()
-            if output_color_valid_pixels > 0:
-                output_color_predictions_i = output_color_logits[i].argmax(dim=-1)
-                output_color_correct_pixels = (
-                    (
-                        output_color_predictions_i[output_color_valid_mask_i]
-                        == output_colors[i][output_color_valid_mask_i]
-                    )
-                    .sum()
-                    .item()
-                )
-
-            # Calculate mask accuracies for this example
-            input_mask_predictions_i = (input_mask_logits[i] > 0).squeeze(-1)
-            output_mask_predictions_i = (output_mask_logits[i] > 0).squeeze(-1)
-            input_mask_correct_pixels = (
-                (input_mask_predictions_i == input_masks[i]).sum().item()
-            )
-            output_mask_correct_pixels = (
-                (output_mask_predictions_i == output_masks[i]).sum().item()
-            )
-
-            # Store metrics for this index
-            if idx not in self.training_index_metrics:
-                self.training_index_metrics[idx] = {
-                    "input_color_correct": 0,
-                    "input_color_total": 0,
-                    "output_color_correct": 0,
-                    "output_color_total": 0,
-                    "input_mask_correct": 0,
-                    "input_mask_total": 0,
-                    "output_mask_correct": 0,
-                    "output_mask_total": 0,
-                    "count": 0,
-                }
-
-            self.training_index_metrics[idx][
-                "input_color_correct"
-            ] += input_color_correct_pixels
-            self.training_index_metrics[idx][
-                "input_color_total"
-            ] += input_color_valid_pixels
-            self.training_index_metrics[idx][
-                "output_color_correct"
-            ] += output_color_correct_pixels
-            self.training_index_metrics[idx][
-                "output_color_total"
-            ] += output_color_valid_pixels
-            self.training_index_metrics[idx][
-                "input_mask_correct"
-            ] += input_mask_correct_pixels
-            self.training_index_metrics[idx]["input_mask_total"] += 900  # 30x30
-            self.training_index_metrics[idx][
-                "output_mask_correct"
-            ] += output_mask_correct_pixels
-            self.training_index_metrics[idx]["output_mask_total"] += 900  # 30x30
-            self.training_index_metrics[idx]["count"] += 1
+        self.log_metrics(metrics, "train")
+        self.log("train_total_loss", total_loss)  # type: ignore
 
         # Visualize every 10 epochs
         if self.current_epoch % 10 == 0 and batch_idx == 0:
-            # self.visualize_predictions(
-            #     input_features[0:1], input_colors[0:1], input_color_logits[0:1], "input"
-            # )
-            for i in range(len(output_features)):
+            for idx in range(len(i.out.fea)):
                 self.visualize_predictions(
-                    output_features[i : i + 1],
-                    output_colors[i : i + 1],
-                    output_color_logits[i : i + 1],
+                    i.out.col[idx : idx + 1],
+                    i.out.msk[idx : idx + 1],
                     "output",
                 )
         return total_loss
 
+    def log_metrics(
+        self, metrics: Dict[int, Dict[str, int]], prefix: str = "train"
+    ) -> None:
+        for idx in metrics.keys():
+            for key, value in metrics[idx].items():
+                self.log(f"{prefix}_{key}", value)  # type: ignore
+
     def on_train_epoch_end(self) -> None:
         """Print training per-index accuracy at the end of each epoch."""
-        if self.training_index_metrics:
-            print(f"\nTraining Per-Index Accuracy (Epoch {self.current_epoch}):")
+        self.epoch_end("train")
+
+    def on_validation_epoch_start(self) -> None:
+        """Reset validation outputs at the start of each epoch."""
+        self.epoch_end("val")
+
+    def epoch_end(self, step_type: Literal["train", "val"]) -> None:
+        if step_type == "train":
+            metrics = self.training_index_metrics
+        else:
+            metrics = self.validation_index_metrics
+
+        if metrics:
             print(
-                f"{'Index':<8} {'Input Color':<12} {'Output Color':<12} {'Input Mask':<12} {'Output Mask':<12} {'All Perfect':<12}"
+                f"\n{step_type.upper()} Per-Index Accuracy (Epoch {self.current_epoch}):"
             )
-            print("-" * 70)
+            print(f"{'Index':<8} {'Output Pixels':<12} {'All Perfect':<12}")
+            print("-" * 50)
 
             for idx in sorted(self.training_index_metrics.keys()):
                 metrics = self.training_index_metrics[idx]
+                out_pix_incor = metrics["output_pixels_incorrect"]
 
-                input_color_acc = 0.0
-                if metrics["input_color_total"] > 0:
-                    input_color_acc = (
-                        metrics["input_color_correct"] / metrics["input_color_total"]
-                    )
-
-                output_color_acc = 0.0
-                if metrics["output_color_total"] > 0:
-                    output_color_acc = (
-                        metrics["output_color_correct"] / metrics["output_color_total"]
-                    )
-
-                input_mask_acc = 0.0
-                if metrics["input_mask_total"] > 0:
-                    input_mask_acc = (
-                        metrics["input_mask_correct"] / metrics["input_mask_total"]
-                    )
-
-                output_mask_acc = 0.0
-                if metrics["output_mask_total"] > 0:
-                    output_mask_acc = (
-                        metrics["output_mask_correct"] / metrics["output_mask_total"]
-                    )
-
-                all_perfect = (
-                    (input_color_acc >= 1.0)
-                    and (output_color_acc >= 1.0)
-                    and (input_mask_acc >= 1.0)
-                    and (output_mask_acc >= 1.0)
-                )
-
-                print(
-                    f"{idx:<8} {input_color_acc:<12.2%} {output_color_acc:<12.2%} {input_mask_acc:<12.2%} {output_mask_acc:<12.2%} {'✓' if all_perfect else '✗':<12}"
-                )
+                all_perfect = "✓" if out_pix_incor == 0 else "✗"
+                print(f"{idx:<8} {out_pix_incor:<12.2%} {all_perfect:<12}")
 
         # Clear training metrics for next epoch
         self.training_index_metrics = {}
 
-    def validation_step(
-        self, batch: Tuple[torch.Tensor, ...], batch_idx: int
-    ) -> Dict[str, torch.Tensor]:
-        # Handle new data_loader.py format: (inputs, outputs, inputs_features, outputs_features)
-        if len(batch) == 4:
-            inputs_one_hot, outputs_one_hot, input_features, output_features = batch
-
-            input_features = input_features.float()
-            output_features = output_features.float()
-            # Extract colors and masks from the grid data
-            input_colors = inputs_one_hot.argmax(dim=-1).long()
-            output_colors = outputs_one_hot.argmax(dim=-1).long()
-            # Change any colors >= 10 to -1 (mask)
-            input_colors = torch.where(input_colors >= 10, -1, input_colors)
-            output_colors = torch.where(output_colors >= 10, -1, output_colors)
-            input_masks = input_colors >= 0
-            output_masks = output_colors >= 0
-
-            # For validation, we don't need example indices - use simple range
-            example_indices = torch.arange(len(input_features), device=self.device)
-        else:
-            # Legacy format for backward compatibility
-            (
-                input_features,
-                output_features,
-                input_colors,
-                output_colors,
-                input_masks,
-                output_masks,
-                example_indices,
-                _,
-            ) = batch
-
-        # For validation, we don't use example indices
-        input_color_logits, input_mask_logits = self(input_features)
-        output_color_logits, output_mask_logits = self(output_features)
-
-        # Compute color losses
-        input_color_loss = F.cross_entropy(
-            input_color_logits.reshape(-1, input_color_logits.size(-1)),
-            input_colors.reshape(-1),
-        )
-        output_color_loss = F.cross_entropy(
-            output_color_logits.reshape(-1, output_color_logits.size(-1)),
-            output_colors.reshape(-1),
-        )
-
-        # Compute mask losses
-        input_mask_loss = F.binary_cross_entropy_with_logits(
-            input_mask_logits.reshape(-1), input_masks.reshape(-1).float()
-        )
-        output_mask_loss = F.binary_cross_entropy_with_logits(
-            output_mask_logits.reshape(-1), output_masks.reshape(-1).float()
-        )
-
-        total_loss = (
-            input_color_loss + output_color_loss + input_mask_loss + output_mask_loss
-        )
-
-        # Compute color accuracy
-        input_color_predictions = input_color_logits.argmax(dim=-1)  # [B, 30, 30]
-        output_color_predictions = output_color_logits.argmax(dim=-1)  # [B, 30, 30]
-
-        # Create separate masks for input and output colors
-        input_color_valid_mask = input_colors != -1
-        output_color_valid_mask = output_colors != -1
-
-        # Calculate color accuracies
-        input_color_accuracy = torch.tensor(0.0)
-        output_color_accuracy = torch.tensor(0.0)
-
-        if input_color_valid_mask.any():
-            input_color_accuracy = (
-                (
-                    input_color_predictions[input_color_valid_mask]
-                    == input_colors[input_color_valid_mask]
-                )
-                .float()
-                .mean()
-            )
-
-        if output_color_valid_mask.any():
-            output_color_accuracy = (
-                (
-                    output_color_predictions[output_color_valid_mask]
-                    == output_colors[output_color_valid_mask]
-                )
-                .float()
-                .mean()
-            )
-
-        # Combined color accuracy for logging
-        all_color_predictions = torch.cat(
-            [input_color_predictions.flatten(), output_color_predictions.flatten()]
-        )
-        all_color_targets = torch.cat([input_colors.flatten(), output_colors.flatten()])
-        valid_color_mask = all_color_targets != -1
-
-        if valid_color_mask.any():
-            color_accuracy = (
-                (
-                    all_color_predictions[valid_color_mask]
-                    == all_color_targets[valid_color_mask]
-                )
-                .float()
-                .mean()
-            )
-        else:
-            color_accuracy = torch.tensor(0.0)
-
-        # Compute mask accuracy
-        input_mask_predictions = (input_mask_logits > 0).squeeze(-1)  # [B, 30, 30]
-        output_mask_predictions = (output_mask_logits > 0).squeeze(-1)  # [B, 30, 30]
-
-        # Calculate mask accuracies
-        input_mask_accuracy = (input_mask_predictions == input_masks).float().mean()
-        output_mask_accuracy = (output_mask_predictions == output_masks).float().mean()
-
-        # Combined mask accuracy
-        all_mask_predictions = torch.cat(
-            [input_mask_predictions.flatten(), output_mask_predictions.flatten()]
-        )
-        all_mask_targets = torch.cat([input_masks.flatten(), output_masks.flatten()])
-        mask_accuracy = (all_mask_predictions == all_mask_targets).float().mean()
-
-        self.log("val_loss", total_loss)
-        self.log("val_color_acc", color_accuracy)
-        self.log("val_mask_acc", mask_accuracy)
-
-        # Calculate per-index metrics
-        for i in range(len(example_indices)):
-            idx = example_indices[i].item()
-
-            # Calculate input color accuracy for this example
-            input_color_valid_pixels = input_color_valid_mask[i].sum().item()
-            input_color_correct_pixels = 0
-            if input_color_valid_pixels > 0:
-                input_color_correct_pixels = (
-                    (
-                        input_color_predictions[i][input_color_valid_mask[i]]
-                        == input_colors[i][input_color_valid_mask[i]]
-                    )
-                    .sum()
-                    .item()
-                )
-
-            # Calculate output color accuracy for this example
-            output_color_valid_pixels = output_color_valid_mask[i].sum().item()
-            output_color_correct_pixels = 0
-            if output_color_valid_pixels > 0:
-                output_color_correct_pixels = (
-                    (
-                        output_color_predictions[i][output_color_valid_mask[i]]
-                        == output_colors[i][output_color_valid_mask[i]]
-                    )
-                    .sum()
-                    .item()
-                )
-
-            # Calculate mask accuracies for this example
-            input_mask_correct_pixels = (
-                (input_mask_predictions[i] == input_masks[i]).sum().item()
-            )
-            output_mask_correct_pixels = (
-                (output_mask_predictions[i] == output_masks[i]).sum().item()
-            )
-
-            # Store metrics for this index
-            if idx not in self.index_metrics:
-                self.index_metrics[idx] = {
-                    "input_color_correct": 0,
-                    "input_color_total": 0,
-                    "output_color_correct": 0,
-                    "output_color_total": 0,
-                    "input_mask_correct": 0,
-                    "input_mask_total": 0,
-                    "output_mask_correct": 0,
-                    "output_mask_total": 0,
-                    "count": 0,
-                }
-
-            self.index_metrics[idx]["input_color_correct"] += input_color_correct_pixels
-            self.index_metrics[idx]["input_color_total"] += input_color_valid_pixels
-            self.index_metrics[idx][
-                "output_color_correct"
-            ] += output_color_correct_pixels
-            self.index_metrics[idx]["output_color_total"] += output_color_valid_pixels
-            self.index_metrics[idx]["input_mask_correct"] += input_mask_correct_pixels
-            self.index_metrics[idx]["input_mask_total"] += 900  # 30x30
-            self.index_metrics[idx]["output_mask_correct"] += output_mask_correct_pixels
-            self.index_metrics[idx]["output_mask_total"] += 900  # 30x30
-            self.index_metrics[idx]["count"] += 1
-
-        # Store outputs for epoch-level metrics
-        self.validation_outputs.append(
-            {
-                "val_loss": total_loss,
-                "val_color_acc": color_accuracy,
-                "val_mask_acc": mask_accuracy,
-                "input_color_predictions": input_color_predictions[
-                    input_color_valid_mask
-                ],
-                "input_color_targets": input_colors[input_color_valid_mask],
-                "output_color_predictions": output_color_predictions[
-                    output_color_valid_mask
-                ],
-                "output_color_targets": output_colors[output_color_valid_mask],
-                "input_mask_predictions": input_mask_predictions.flatten(),
-                "input_mask_targets": input_masks.flatten(),
-                "output_mask_predictions": output_mask_predictions.flatten(),
-                "output_mask_targets": output_masks.flatten(),
-                # Store full grids for visualization
-                "full_output_color_predictions": output_color_predictions,
-                "full_output_color_targets": output_colors,
-                "batch_size": input_color_valid_mask.sum()
-                + output_color_valid_mask.sum(),
-            }
-        )
-
-        return {
-            "val_loss": total_loss,
-            "val_color_acc": color_accuracy,
-            "val_mask_acc": mask_accuracy,
-        }
-
-    def on_validation_epoch_start(self) -> None:
-        """Reset validation outputs at the start of each epoch."""
-        self.validation_outputs = []
-
-    def on_validation_epoch_end(self) -> None:
-        """Calculate epoch-level metrics from all validation batches."""
-        if not self.validation_outputs:
-            return
-
-        # Gather INPUT color predictions and targets
-        input_color_predictions = torch.cat(
-            [out["input_color_predictions"] for out in self.validation_outputs]
-        )
-        input_color_targets = torch.cat(
-            [out["input_color_targets"] for out in self.validation_outputs]
-        )
-
-        # Gather OUTPUT color predictions and targets
-        output_color_predictions = torch.cat(
-            [out["output_color_predictions"] for out in self.validation_outputs]
-        )
-        output_color_targets = torch.cat(
-            [out["output_color_targets"] for out in self.validation_outputs]
-        )
-
-        # Gather mask predictions and targets
-        input_mask_predictions = torch.cat(
-            [out["input_mask_predictions"] for out in self.validation_outputs]
-        )
-        input_mask_targets = torch.cat(
-            [out["input_mask_targets"] for out in self.validation_outputs]
-        )
-        output_mask_predictions = torch.cat(
-            [out["output_mask_predictions"] for out in self.validation_outputs]
-        )
-        output_mask_targets = torch.cat(
-            [out["output_mask_targets"] for out in self.validation_outputs]
-        )
-
-        # Calculate separate color accuracies
-        input_color_accuracy = (
-            (input_color_predictions == input_color_targets).float().mean()
-        )
-        output_color_accuracy = (
-            (output_color_predictions == output_color_targets).float().mean()
-        )
-
-        # Calculate separate mask accuracies
-        input_mask_accuracy = (
-            (input_mask_predictions == input_mask_targets).float().mean()
-        )
-        output_mask_accuracy = (
-            (output_mask_predictions == output_mask_targets).float().mean()
-        )
-
-        # Overall accuracies
-        all_color_predictions = torch.cat(
-            [input_color_predictions, output_color_predictions]
-        )
-        all_color_targets = torch.cat([input_color_targets, output_color_targets])
-        overall_color_accuracy = (
-            (all_color_predictions == all_color_targets).float().mean()
-        )
-
-        all_mask_predictions = torch.cat(
-            [input_mask_predictions, output_mask_predictions]
-        )
-        all_mask_targets = torch.cat([input_mask_targets, output_mask_targets])
-        overall_mask_accuracy = (
-            (all_mask_predictions == all_mask_targets).float().mean()
-        )
-
-        # Calculate epoch loss
-        epoch_loss = torch.stack(
-            [out["val_loss"] for out in self.validation_outputs]
-        ).mean()
-
-        # Log all metrics
-        self.log("val_epoch_color_acc", overall_color_accuracy, prog_bar=True)
-        self.log("val_epoch_mask_acc", overall_mask_accuracy, prog_bar=True)
-        self.log("val_epoch_loss", epoch_loss, prog_bar=True)
-        self.log("val_input_color_acc", input_color_accuracy, prog_bar=True)
-        self.log("val_output_color_acc", output_color_accuracy, prog_bar=True)
-        self.log("val_input_mask_acc", input_mask_accuracy, prog_bar=True)
-        self.log("val_output_mask_acc", output_mask_accuracy, prog_bar=True)
-
-        # For early stopping, we need BOTH input and output colors AND masks to be 100%
-        colors_perfect = (input_color_accuracy >= 1.0) and (
-            output_color_accuracy >= 1.0
-        )
-        masks_perfect = (input_mask_accuracy >= 1.0) and (output_mask_accuracy >= 1.0)
-        both_perfect = colors_perfect and masks_perfect
-        self.log("val_both_perfect", float(both_perfect), prog_bar=True)
-
-        # Debug output every 20 epochs
-        if self.current_epoch % 20 == 0:
-            print(f"\nEpoch {self.current_epoch} validation results:")
-            print(
-                f"  INPUT color accuracy: {input_color_accuracy:.4f} ({input_color_targets.numel()} pixels)"
-            )
-            print(
-                f"  OUTPUT color accuracy: {output_color_accuracy:.4f} ({output_color_targets.numel()} pixels)"
-            )
-            print(
-                f"  INPUT mask accuracy: {input_mask_accuracy:.4f} ({input_mask_targets.numel()} pixels)"
-            )
-            print(
-                f"  OUTPUT mask accuracy: {output_mask_accuracy:.4f} ({output_mask_targets.numel()} pixels)"
-            )
-            print(f"  Colors perfect: {colors_perfect}, Masks perfect: {masks_perfect}")
-
-            # Visualization every 10 epochs (same frequency as training)
-        if self.current_epoch % 10 == 0 and self.validation_outputs:
-            # Get first validation batch for visualization
-            first_batch = self.validation_outputs[0]
-            if "full_output_color_predictions" in first_batch:
-                # Use the full grids (first example from the batch)
-                full_pred = first_batch["full_output_color_predictions"]
-                full_true = first_batch["full_output_color_targets"]
-
-                if len(full_pred) > 0:
-                    # Show validation visualization for each example in the first batch
-                    for i in range(len(full_pred)):
-                        output_pred = full_pred[i]  # [30, 30]
-                        output_true = full_true[i]  # [30, 30]
-
-                        # Show validation visualization using the same function
-                        self._print_prediction_results(
-                            output_pred,
-                            output_true,
-                            f"VALIDATION OUTPUT - Epoch {self.current_epoch}",
-                        )
-
-        # Print per-index accuracy
-        if self.index_metrics:
-            print(f"\nPer-Index Accuracy (Epoch {self.current_epoch}):")
-            print(
-                f"{'Index':<8} {'Input Color':<12} {'Output Color':<12} {'Input Mask':<12} {'Output Mask':<12} {'All Perfect':<12}"
-            )
-            print("-" * 70)
-
-            for idx in sorted(self.index_metrics.keys()):
-                metrics = self.index_metrics[idx]
-
-                input_color_acc = 0.0
-                if metrics["input_color_total"] > 0:
-                    input_color_acc = (
-                        metrics["input_color_correct"] / metrics["input_color_total"]
-                    )
-
-                output_color_acc = 0.0
-                if metrics["output_color_total"] > 0:
-                    output_color_acc = (
-                        metrics["output_color_correct"] / metrics["output_color_total"]
-                    )
-
-                input_mask_acc = 0.0
-                if metrics["input_mask_total"] > 0:
-                    input_mask_acc = (
-                        metrics["input_mask_correct"] / metrics["input_mask_total"]
-                    )
-
-                output_mask_acc = 0.0
-                if metrics["output_mask_total"] > 0:
-                    output_mask_acc = (
-                        metrics["output_mask_correct"] / metrics["output_mask_total"]
-                    )
-
-                all_perfect = (
-                    (input_color_acc >= 1.0)
-                    and (output_color_acc >= 1.0)
-                    and (input_mask_acc >= 1.0)
-                    and (output_mask_acc >= 1.0)
-                )
-
-                print(
-                    f"{idx:<8} {input_color_acc:<12.2%} {output_color_acc:<12.2%} {input_mask_acc:<12.2%} {output_mask_acc:<12.2%} {'✓' if all_perfect else '✗':<12}"
-                )
-
-        # Clear validation outputs and index metrics for next epoch
-        self.validation_outputs = []
-        self.index_metrics = {}
-
-    def configure_optimizers(self) -> Dict[str, Any]:
+    def configure_optimizers(self):
         # Use SGD with momentum for faster convergence on small dataset
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -1004,31 +549,20 @@ class OptimizedMemorizationModel(pl.LightningModule):
             },
         }
 
-    def set_available_colors(self, colors: List[int]) -> None:
-        """Set the available colors for this model."""
-        self.available_colors = colors
-
     def visualize_predictions(
         self,
-        features: torch.Tensor,
         targets: torch.Tensor,
         predictions: torch.Tensor,
         prefix: str,
     ) -> None:
         """Visualize predictions vs ground truth for training."""
-        self._print_prediction_results(
-            predictions[0].argmax(dim=-1).cpu(),
-            targets[0].cpu(),
-            f"{prefix.upper()} - Epoch {self.current_epoch}",
-        )
 
-    def _print_prediction_results(
-        self, pred_colors: torch.Tensor, true_colors: torch.Tensor, header: str
-    ) -> None:
-        """Shared visualization function for both training and validation."""
+        pred_colors = predictions[0].argmax(dim=-1).cpu()
+        true_colors = targets[0].cpu()
+
         # Create visualization
         print(f"\n{'='*60}")
-        print(header)
+        print(f"{prefix.upper()} - Epoch {self.current_epoch}")
         print(f"{'='*60}")
 
         # Show ground truth
@@ -1037,7 +571,7 @@ class OptimizedMemorizationModel(pl.LightningModule):
 
         # Show predictions
         print("\nPredicted colors:")
-        imshow(pred_colors, title=None, show_legend=True)
+        imshow(pred_colors, title=None, show_legend=True, correct=true_colors)
 
         # Calculate accuracy for this example
         valid_mask = true_colors != -1
@@ -1046,17 +580,6 @@ class OptimizedMemorizationModel(pl.LightningModule):
                 (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
             )
             print(f"\nAccuracy: {accuracy:.2%}")
-
-            # Per-color accuracy
-            print("\nPer-color accuracy:")
-            unique_colors = torch.unique(true_colors[valid_mask])
-            for color in unique_colors:
-                color_mask = true_colors == color
-                if color_mask.any():
-                    color_acc = (pred_colors[color_mask] == color).float().mean()
-                    print(
-                        f"  Color {color.item()}: {color_acc:.2%} ({color_mask.sum().item()} pixels)"
-                    )
 
 
 class SpatialMessagePassing(nn.Module):
@@ -1233,17 +756,6 @@ class NeuralCellularAutomata(nn.Module):
         # Stochastic update (only fraction of cells update each step)
         self.update_probability = 0.5
 
-    def perceive(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply learnable perception filters to extract local features.
-        x: [B, C, H, W] where C=hidden_dim
-        Returns: [B, C*3, H, W] (3 filters per channel)
-        """
-        # Apply learnable perception convolution
-        # This automatically handles the grouped convolution for all channels
-        perceived = self.perception_conv(x)  # [B, C*3, H, W]
-        return perceived
-
     def stochastic_update(self, x: torch.Tensor, dx: torch.Tensor) -> torch.Tensor:
         """
         Apply stochastic updates - only some cells update each step.
@@ -1272,7 +784,7 @@ class NeuralCellularAutomata(nn.Module):
         x = h.permute(0, 3, 1, 2).contiguous()
 
         # Step 1: Perceive local neighborhood
-        perceived = self.perceive(x)
+        perceived = self.perception_conv(x)
 
         # Step 2: Compute state update
         dx = self.update_net(perceived)
@@ -1296,7 +808,9 @@ class PerfectAccuracyEarlyStopping(Callback):
         self.perfect_epochs = 0
         self.best_epoch = -1
 
-    def on_validation_epoch_end(self, trainer, pl_module):
+    def on_validation_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ):
         # Get the current epoch metrics
         input_color_acc = trainer.callback_metrics.get("val_input_color_acc", 0.0)
         output_color_acc = trainer.callback_metrics.get("val_output_color_acc", 0.0)
@@ -1596,7 +1110,7 @@ def main():
     model.noise_prob = args.noise_prob
 
     # Set available colors
-    model.set_available_colors(available_colors)
+    model.available_colors = available_colors
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -1833,7 +1347,7 @@ def load_color_model_for_inference(
     model.load_state_dict(saved_data["model_state_dict"])
 
     # Set available colors
-    model.set_available_colors(saved_data["available_colors"])
+    model.available_colors = saved_data["available_colors"]
 
     # Set to evaluation mode
     model.eval()
