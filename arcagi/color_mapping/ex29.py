@@ -2,7 +2,6 @@ import os
 
 # Import from parent module
 import sys
-from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import click
@@ -19,6 +18,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import our visualization tools
 # Import data loading functions
 from data_loader import create_dataloader, prepare_dataset
+from models import Batch, BatchData
+from utils.metrics import training_index_metrics
 from utils.terminal_imshow import imshow
 
 
@@ -115,27 +116,6 @@ def apply_color_constraints(
     return logits
 
 
-@dataclass
-class Batch:
-    """Dataclass to hold output batch data with proper typing."""
-
-    one: torch.Tensor  # one hot [B, 30, 30, 10]
-    fea: torch.Tensor  # order2 features [B, 30, 30, 147]
-    col: torch.Tensor  # colors, int array [B, 30, 30]
-    msk: torch.Tensor  # masks, bool array [B, 30, 30]
-    colf: torch.Tensor  # colors, flattened [B, 30*30]
-    mskf: torch.Tensor  # masks, flattened [B, 30*30]
-    idx: torch.Tensor  # indices [B]
-
-
-@dataclass
-class BatchData:
-    """Dataclass to hold complete batch data with proper typing."""
-
-    inp: Batch
-    out: Batch
-
-
 def batch_to_dataclass(
     batch: Tuple[torch.Tensor, ...],
 ) -> BatchData:
@@ -184,63 +164,6 @@ def batch_to_dataclass(
     )
 
     return BatchData(inp=inp, out=out)
-
-
-def color_accuracy(
-    logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor
-) -> torch.Tensor:
-    predictions = logits.argmax(dim=-1)
-    return (predictions[valid_mask] == targets[valid_mask]).float().mean()
-
-
-def mask_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    predictions = (logits > 0).float()
-    return (predictions == targets.float()).float().mean()
-
-
-def training_index_metrics(
-    i: BatchData,
-    col_log: torch.Tensor,
-    msk_log: torch.Tensor,
-    prefix: str,
-    metrics_dict: Dict[int, Dict[str, int]],
-) -> Dict[int, Dict[str, int]]:
-    # For every index in the batch, compute the metrics:
-    # Compute total number of actiev pixels not-masked
-    # Compute number of correct color pixels
-    # Compute number of correct mask pixels
-
-    # Get predictions
-    col_pred = col_log.argmax(dim=-1)  # [B, 30, 30]
-    msk_pred = (msk_log > 0).squeeze(-1)  # [B, 30, 30]
-
-    batch_size = i.inp.col.shape[0]
-
-    # Calculate pixel metrics: use the actual mask tensor i.inp.msk instead of mskf
-    # i.inp.msk should have shape [B, 30, 30]
-    pixels_per_index = i.inp.msk.sum(dim=(1, 2))  # Sum over spatial dimensions [B]
-    pixels_incorrect = (col_pred != i.inp.col) | (msk_pred != i.inp.msk)
-    pixels_incorrect_sum = pixels_incorrect.sum(
-        dim=(1, 2)
-    )  # Sum over spatial dimensions [B]
-
-    # Ensure tensors have the right shape for edge cases
-    if pixels_per_index.dim() == 0:
-        pixels_per_index = pixels_per_index.unsqueeze(0)
-    if pixels_incorrect_sum.dim() == 0:
-        pixels_incorrect_sum = pixels_incorrect_sum.unsqueeze(0)
-
-    for idx in range(batch_size):
-        if idx not in metrics_dict:
-            metrics_dict[idx] = {}
-        metrics_dict[idx][f"{prefix}_pixels_per_index"] = int(
-            pixels_per_index[idx].item()
-        )
-        metrics_dict[idx][f"{prefix}_pixels_incorrect"] = int(
-            pixels_incorrect_sum[idx].item()
-        )
-
-    return metrics_dict
 
 
 def create_sinusoidal_embeddings(hidden_dim: int) -> torch.Tensor:
@@ -510,26 +433,20 @@ class OptimizedMemorizationModel(pl.LightningModule):
         # Compute losses for order2->color
         # for (input/output) x (colors/masks)
         losses: List[torch.Tensor] = []
-        metrics: Dict[int, Dict[str, int]] = {}
+        metrics: Dict[int, Dict[str, float]] = {}
         for prefix, ex in [("input", i.inp), ("output", i.out)]:
             col_log, msk_log = self(ex.fea)
             col_logf = col_log.reshape(-1, col_log.size(-1))
 
             # Filter out -1 targets (invalid/masked pixels)
-            valid_mask = ex.colf != -1
-            if valid_mask.any():
-                col_loss = F.cross_entropy(col_logf[valid_mask], ex.colf[valid_mask])
-            else:
-                col_loss = torch.tensor(0.0, device=col_logf.device)
+            ex_mask = ex.colf != -1
+            col_loss = F.cross_entropy(col_logf[ex_mask], ex.colf[ex_mask])
 
             msk_logf = msk_log.reshape(-1)
             # Also filter mask loss for consistency
-            if valid_mask.any():
-                msk_loss = F.binary_cross_entropy_with_logits(
-                    msk_logf[valid_mask], ex.mskf[valid_mask]
-                )
-            else:
-                msk_loss = torch.tensor(0.0, device=msk_logf.device)
+            msk_loss = F.binary_cross_entropy_with_logits(
+                msk_logf[ex_mask], ex.mskf[ex_mask]
+            )
             losses.append(col_loss + msk_loss)
             training_index_metrics(i, col_log, msk_log, prefix, metrics)
 
@@ -537,12 +454,12 @@ class OptimizedMemorizationModel(pl.LightningModule):
             if self.force_visualize or (
                 self.current_epoch % 10 == 0 and batch_idx == 0
             ):
-                for idx in range(min(5, len(i.out.fea))):
-                    self.visualize_predictions(
-                        i.out.col[idx : idx + 1],
-                        col_log,
-                        "output",
-                    )
+                self.visualize_predictions(
+                    i,
+                    ex.col,
+                    col_log,
+                    f"{prefix}-{step_type}",
+                )
         if step_type == "train":
             self.training_index_metrics = metrics
         else:
@@ -631,15 +548,20 @@ class OptimizedMemorizationModel(pl.LightningModule):
             print(
                 f"\n{step_type.upper()} Per-Index Accuracy (Epoch {self.current_epoch}):"
             )
-            print(f"{'Index':<8} {'Output Pixels':<12} {'All Perfect':<12}")
+            print(
+                f"{'Index':<8} {'Output Pixels':<12} {'Output Mask':<12} {'All Perfect':<12}"
+            )
             print("-" * 50)
 
             for idx in sorted(self.training_index_metrics.keys()):
                 metrics = self.training_index_metrics[idx]
-                out_pix_incor = metrics["output_pixels_incorrect"]
+                out_pix_incor = metrics["output_n_incorrect_num_color"]
+                out_msk_incor = metrics["output_n_incorrect_num_mask"]
 
                 all_perfect = "✓" if out_pix_incor == 0 else "✗"
-                print(f"{idx:<8} {out_pix_incor:<12} {all_perfect:<12}")
+                print(
+                    f"{idx:<8} {out_pix_incor:<12} {out_msk_incor:<12} {all_perfect:<12}"
+                )
 
         # Clear training metrics for next epoch
         self.training_index_metrics = {}
@@ -679,39 +601,43 @@ class OptimizedMemorizationModel(pl.LightningModule):
 
     def visualize_predictions(
         self,
+        i: BatchData,
         targets: torch.Tensor,
         predictions: torch.Tensor,
         prefix: str,
     ) -> None:
         """Visualize predictions vs ground truth for training."""
+        # Get the first unique index from the batch
+        _, inverse_indices = torch.unique(i.inp.idx, return_inverse=True)  # type: ignore
 
-        pred_colors = predictions[0].argmax(dim=-1).cpu()
-        true_colors = targets[0].cpu()
+        for idx in inverse_indices:
+            pred_colors = predictions[idx].argmax(dim=-1).cpu()
+            true_colors = targets[idx].cpu()
 
-        # Create visualization
-        print(f"\n{'='*60}")
-        print(f"{prefix.upper()} - Epoch {self.current_epoch}")
-        print(f"{'='*60}")
+            # Create visualization
+            print(f"\n{'='*60}")
+            print(f"{prefix.upper()} - Epoch {self.current_epoch}")
+            print(f"{'='*60}")
 
-        # Show ground truth
-        print("\nGround Truth colors:")
-        imshow(true_colors, title=None, show_legend=True)
+            # Show ground truth
+            print("\nGround Truth colors:")
+            imshow(true_colors, title=None, show_legend=True)
 
-        # Show predictions
-        print("\nPredicted colors:")
-        correct = true_colors == pred_colors | true_colors == -1
-        imshow(pred_colors, title=None, show_legend=True, correct=correct)
+            # Show predictions
+            print("\nPredicted colors:")
+            correct = (true_colors == pred_colors) | (true_colors == -1)
+            imshow(pred_colors, title=None, show_legend=True, correct=correct)
 
-        # Calculate accuracy for this example
-        valid_mask = true_colors != -1
-        if valid_mask.any():
-            accuracy = (
-                (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
-            )
+            # Calculate accuracy for this example
+            valid_mask = true_colors != -1
+            if valid_mask.any():
+                accuracy = (
+                    (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
+                )
 
-            # Also show mask predictions vs ground truth
-            print("\nMask predictions (True=active pixel, False=inactive):")
-            print(f"\nColor Accuracy: {accuracy:.2%}")
+                # Also show mask predictions vs ground truth
+                print("\nMask predictions (True=active pixel, False=inactive):")
+                print(f"\nColor Accuracy: {accuracy:.2%}")
 
 
 class SpatialMessagePassing(nn.Module):

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 # Import visualization tools
-from utils.terminal_relshow import relshow
+from .terminal_relshow import relshow
 
 # Global color model cache
 _COLOR_MODEL_CACHE: Dict[str, Any] = {}

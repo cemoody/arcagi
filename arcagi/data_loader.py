@@ -144,7 +144,14 @@ def filter_by_filename(
     dataset_name: str = "data",
     inputs_features: Optional[torch.Tensor] = None,
     outputs_features: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    indices: Optional[List[int]] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[List[int]],
+]:
     """Filter tensors to only include examples from a specific filename.
 
     Args:
@@ -155,9 +162,10 @@ def filter_by_filename(
         dataset_name: Name of dataset for logging (e.g., "training", "validation")
         inputs_features: Optional invariant input features to filter
         outputs_features: Optional invariant output features to filter
+        indices: Optional list of indices to filter
 
     Returns:
-        Filtered inputs, outputs, and optionally invariant tensors
+        Filtered inputs, outputs, optionally invariant tensors, and optionally indices
 
     Raises:
         ValueError: If no examples found with the target filename (only for non-validation sets)
@@ -178,7 +186,7 @@ def filter_by_filename(
             empty_features = (
                 torch.empty(0, 30, 30, 44) if inputs_features is not None else None
             )
-            return empty_inputs, empty_outputs, empty_features, empty_features
+            return empty_inputs, empty_outputs, empty_features, empty_features, []
         else:
             raise ValueError(
                 f"No {dataset_name} examples found with filename: {target_filename}"
@@ -195,6 +203,11 @@ def filter_by_filename(
     if outputs_features is not None:
         filtered_outputs_features = outputs_features[filtered_indices]
 
+    # Filter indices
+    filtered_indices_list = None
+    if indices is not None:
+        filtered_indices_list = [indices[i] for i in filtered_indices]
+
     print(
         f"Found {len(filtered_indices)} {dataset_name} examples with filename {target_filename}"
     )
@@ -204,6 +217,7 @@ def filter_by_filename(
         filtered_outputs,
         filtered_inputs_features,
         filtered_outputs_features,
+        filtered_indices_list,
     )
 
 
@@ -214,7 +228,14 @@ def filter_by_subset(
     use_train_subset: bool = True,
     inputs_features: Optional[torch.Tensor] = None,
     outputs_features: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    indices: Optional[List[int]] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[List[int]],
+]:
     """Filter tensors to only include examples from a specific subset (train or test within files).
 
     Args:
@@ -224,13 +245,14 @@ def filter_by_subset(
         use_train_subset: If True, return examples from "train" subset; if False, return examples from "test" subset
         inputs_features: Optional input features to filter
         outputs_features: Optional output features to filter
+        indices: Optional list of indices to filter
 
     Returns:
-        Filtered inputs, outputs, and optionally feature tensors
+        Filtered inputs, outputs, optionally feature tensors, and optionally indices
     """
     if subset_is_train is None:
         print("Warning: No subset information available, returning all examples")
-        return inputs, outputs, inputs_features, outputs_features
+        return inputs, outputs, inputs_features, outputs_features, indices
 
     # Create mask for the desired subset
     if use_train_subset:
@@ -250,7 +272,7 @@ def filter_by_subset(
         empty_features = (
             torch.empty(0, 30, 30, 44) if inputs_features is not None else None
         )
-        return empty_inputs, empty_outputs, empty_features, empty_features
+        return empty_inputs, empty_outputs, empty_features, empty_features, []
 
     # Filter the tensors
     filtered_inputs = inputs[filtered_indices]
@@ -263,6 +285,11 @@ def filter_by_subset(
     if outputs_features is not None:
         filtered_outputs_features = outputs_features[filtered_indices]
 
+    # Filter indices
+    filtered_indices_list = None
+    if indices is not None:
+        filtered_indices_list = [indices[i] for i in filtered_indices]
+
     print(f"Found {len(filtered_indices)} examples in {subset_name} subset")
 
     return (
@@ -270,6 +297,7 @@ def filter_by_subset(
         filtered_outputs,
         filtered_inputs_features,
         filtered_outputs_features,
+        filtered_indices_list,
     )
 
 
@@ -280,7 +308,13 @@ def prepare_dataset(
     use_features: bool = False,
     dataset_name: str = "data",
     use_train_subset: Optional[bool] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+]:
     """Load and prepare a dataset from an NPZ file with optional filtering.
 
     Args:
@@ -292,30 +326,32 @@ def prepare_dataset(
         use_train_subset: Optional bool to filter by subset (True=train subset, False=test subset, None=all)
 
     Returns:
-        Prepared inputs, outputs, and optionally invariant tensors
+        Prepared inputs, outputs, optionally invariant tensors, and indices tensor
     """
     print(f"Loading {dataset_name} from {npz_path}...")
     (
         filenames,
-        _,
+        indices,
         inputs,
         outputs,
         inputs_features,
         outputs_features,
         subset_is_train,
-    ) = load_npz_data(npz_path, use_features=use_features)[
-        :7
-    ]  # Take only first 7 elements
+        _,  # inputs_mask (not needed here)
+        _,  # outputs_mask (not needed here)
+        _,  # indices_tensor (not needed here, we'll create our own)
+    ) = load_npz_data(npz_path, use_features=use_features, load_masks_and_indices=False)
 
     # Apply subset filtering if requested
     if use_train_subset is not None:
-        inputs, outputs, inputs_features, outputs_features = filter_by_subset(
+        inputs, outputs, inputs_features, outputs_features, indices = filter_by_subset(
             inputs,
             outputs,
             subset_is_train,
             use_train_subset,
             inputs_features,
             outputs_features,
+            indices,
         )
 
     # Apply filename filtering if requested
@@ -327,14 +363,17 @@ def prepare_dataset(
         else:
             filtered_filenames = filenames
 
-        inputs, outputs, inputs_features, outputs_features = filter_by_filename(
-            filtered_filenames,
-            inputs,
-            outputs,
-            filter_filename,
-            dataset_name,
-            inputs_features,
-            outputs_features,
+        inputs, outputs, inputs_features, outputs_features, indices = (
+            filter_by_filename(
+                filtered_filenames,
+                inputs,
+                outputs,
+                filter_filename,
+                dataset_name,
+                inputs_features,
+                outputs_features,
+                indices,
+            )
         )
 
     # Apply limit if requested
@@ -345,6 +384,8 @@ def prepare_dataset(
             inputs_features = inputs_features[:limit_examples]
         if outputs_features is not None:
             outputs_features = outputs_features[:limit_examples]
+        if indices is not None:
+            indices = indices[:limit_examples]
         print(f"Limited to {limit_examples} {dataset_name} examples")
 
     print(
@@ -355,7 +396,12 @@ def prepare_dataset(
             f"{dataset_name.capitalize()} invariant shape: inputs_features={inputs_features.shape}"
         )
 
-    return inputs, outputs, inputs_features, outputs_features
+    # Convert indices to tensor
+    indices_tensor = torch.tensor(
+        indices if indices is not None else [], dtype=torch.long
+    )
+
+    return inputs, outputs, inputs_features, outputs_features, indices_tensor
 
 
 def create_dataloader(
@@ -366,6 +412,7 @@ def create_dataloader(
     num_workers: int = 4,
     inputs_features: Optional[torch.Tensor] = None,
     outputs_features: Optional[torch.Tensor] = None,
+    indices: Optional[torch.Tensor] = None,
 ) -> DataLoader[Any]:
     """Create a DataLoader from input and output tensors.
 
@@ -377,14 +424,28 @@ def create_dataloader(
         num_workers: Number of worker processes
         inputs_features: Optional invariant input features
         outputs_features: Optional invariant output features
+        indices: Optional indices tensor
 
     Returns:
         DataLoader instance
     """
-    if inputs_features is not None and outputs_features is not None:
-        dataset = TensorDataset(inputs, outputs, inputs_features, outputs_features)
-    else:
-        dataset = TensorDataset(inputs, outputs)
+    # Create default indices if not provided
+    if indices is None:
+        indices = torch.arange(len(inputs), dtype=torch.long)
+
+    # Always create dataset with all 5 components for consistency
+    inputs_features = (
+        inputs_features
+        if inputs_features is not None
+        else torch.empty(len(inputs), 30, 30, 0)
+    )
+    outputs_features = (
+        outputs_features
+        if outputs_features is not None
+        else torch.empty(len(inputs), 30, 30, 0)
+    )
+
+    dataset = TensorDataset(inputs, outputs, inputs_features, outputs_features, indices)
 
     return DataLoader(
         dataset,
@@ -422,7 +483,7 @@ def load_feature_data(
         train_inputs, train_outputs, train_features, val_inputs, val_outputs, val_features
     """
     # Load training data
-    train_inputs, train_outputs, train_inputs_features, _ = prepare_dataset(
+    train_inputs, train_outputs, train_inputs_features, _, _ = prepare_dataset(
         train_path,
         filter_filename=filename_filter,
         use_features=use_features,
@@ -431,7 +492,7 @@ def load_feature_data(
     )
 
     # Load validation data
-    val_inputs, val_outputs, val_inputs_features, _ = prepare_dataset(
+    val_inputs, val_outputs, val_inputs_features, _, _ = prepare_dataset(
         val_path,
         filter_filename=filename_filter,
         use_features=use_features,

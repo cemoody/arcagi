@@ -8,6 +8,7 @@ import torch
 from arcagi.data_loader import (
     create_dataloader,
     filter_by_filename,
+    filter_by_subset,
     load_feature_mapping_dataloader,
     load_npz_data,
     one_hot_to_categorical,
@@ -239,7 +240,7 @@ def test_one_hot_to_categorical():
 def test_filter_by_filename(npz_files):
     """Test filtering by filename."""
     result = load_npz_data(str(npz_files["npz_path"]), use_features=False)
-    filenames, _, inputs, outputs, _, _ = result[:6]
+    filenames, indices, inputs, outputs, _, _ = result[:6]
 
     # Filter by "file1.json" (should get examples 0 and 2)
     (
@@ -247,17 +248,24 @@ def test_filter_by_filename(npz_files):
         filtered_outputs,
         filtered_features_in,
         filtered_features_out,
-    ) = filter_by_filename(filenames, inputs, outputs, "file1.json", "test")
+        filtered_indices,
+    ) = filter_by_filename(
+        filenames, inputs, outputs, "file1.json", "test", indices=indices
+    )
 
     assert filtered_inputs.shape[0] == 2  # Two examples
     assert filtered_outputs.shape[0] == 2
     assert filtered_features_in is None
     assert filtered_features_out is None
+    assert filtered_indices == [
+        0,
+        1,
+    ]  # Original indices were [0, 0, 1], filtered to [0, 1]
 
 
 def test_prepare_dataset(npz_files):
     """Test dataset preparation."""
-    inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+    inputs, outputs, inputs_features, outputs_features, indices = prepare_dataset(
         str(npz_files["npz_path"]), use_features=False
     )
 
@@ -265,11 +273,14 @@ def test_prepare_dataset(npz_files):
     assert outputs.shape == (3, 30, 30, 11)
     assert inputs_features is None
     assert outputs_features is None
+    assert indices.shape == (3,)
+    assert indices.dtype == torch.long
+    assert indices.tolist() == [0, 0, 1]  # From test data
 
 
 def test_prepare_dataset_with_features(npz_files):
     """Test dataset preparation with features."""
-    inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+    inputs, outputs, inputs_features, outputs_features, indices = prepare_dataset(
         str(npz_files["npz_features_path"]), use_features=True
     )
 
@@ -279,31 +290,46 @@ def test_prepare_dataset_with_features(npz_files):
     assert outputs_features is not None
     assert inputs_features.shape == (3, 30, 30, 44)
     assert outputs_features.shape == (3, 30, 30, 44)
+    assert indices.shape == (3,)
+    assert indices.dtype == torch.long
+    assert indices.tolist() == [0, 0, 1]  # From test data
 
 
 def test_create_dataloader(npz_files):
     """Test DataLoader creation."""
-    inputs, outputs, _, _ = prepare_dataset(
+    inputs, outputs, _, _, indices = prepare_dataset(
         str(npz_files["npz_path"]), use_features=False
     )
 
     dataloader = create_dataloader(
-        inputs, outputs, batch_size=2, shuffle=False, num_workers=0
+        inputs, outputs, batch_size=2, shuffle=False, num_workers=0, indices=indices
     )
 
     # Test that we can iterate through the dataloader
     batches = list(dataloader)
     assert len(batches) == 2  # 3 examples, batch_size=2 -> 2 batches
 
-    # Check first batch
-    batch_inputs, batch_outputs = batches[0]
+    # Check first batch (should have 5 tensors: inputs, outputs, features_in, features_out, indices)
+    batch = batches[0]
+    assert len(batch) == 5
+    (
+        batch_inputs,
+        batch_outputs,
+        batch_features_in,
+        batch_features_out,
+        batch_indices,
+    ) = batch
     assert batch_inputs.shape == (2, 30, 30, 11)
     assert batch_outputs.shape == (2, 30, 30, 11)
+    assert batch_features_in.shape == (2, 30, 30, 0)  # Empty features
+    assert batch_features_out.shape == (2, 30, 30, 0)  # Empty features
+    assert batch_indices.shape == (2,)
+    assert batch_indices.dtype == torch.long
 
 
 def test_create_dataloader_with_features(npz_files):
     """Test DataLoader creation with features."""
-    inputs, outputs, inputs_features, outputs_features = prepare_dataset(
+    inputs, outputs, inputs_features, outputs_features, indices = prepare_dataset(
         str(npz_files["npz_features_path"]), use_features=True
     )
 
@@ -315,20 +341,199 @@ def test_create_dataloader_with_features(npz_files):
         num_workers=0,
         inputs_features=inputs_features,
         outputs_features=outputs_features,
+        indices=indices,
     )
 
     # Test that we can iterate through the dataloader
     batches = list(dataloader)
     assert len(batches) == 2  # 3 examples, batch_size=2 -> 2 batches
 
-    # Check first batch (should have 4 tensors: inputs, outputs, inputs_features, outputs_features)
+    # Check first batch (should have 5 tensors: inputs, outputs, inputs_features, outputs_features, indices)
     batch = batches[0]
-    assert len(batch) == 4
-    batch_inputs, batch_outputs, batch_inputs_features, batch_outputs_features = batch
+    assert len(batch) == 5
+    (
+        batch_inputs,
+        batch_outputs,
+        batch_inputs_features,
+        batch_outputs_features,
+        batch_indices,
+    ) = batch
     assert batch_inputs.shape == (2, 30, 30, 11)
     assert batch_outputs.shape == (2, 30, 30, 11)
     assert batch_inputs_features.shape == (2, 30, 30, 44)
     assert batch_outputs_features.shape == (2, 30, 30, 44)
+    assert batch_indices.shape == (2,)
+    assert batch_indices.dtype == torch.long
+
+
+def test_filter_by_filename_with_indices(npz_files, test_data):
+    """Test filtering by filename with indices propagation."""
+    result = load_npz_data(str(npz_files["npz_path"]), use_features=False)
+    filenames, indices, inputs, outputs, _, _ = result[:6]
+
+    # Test indices before filtering
+    assert indices == test_data["test_indices"]  # [0, 0, 1]
+
+    # Filter by "file2.json" (should get example 1 only)
+    (
+        filtered_inputs,
+        filtered_outputs,
+        filtered_features_in,
+        filtered_features_out,
+        filtered_indices,
+    ) = filter_by_filename(
+        filenames, inputs, outputs, "file2.json", "test", indices=indices
+    )
+
+    assert filtered_inputs.shape[0] == 1  # One example
+    assert filtered_outputs.shape[0] == 1
+    assert filtered_indices == [0]  # Original index 0 from position 1
+
+
+def test_filter_by_subset(npz_files):
+    """Test filtering by subset with indices."""
+    result = load_npz_data(
+        str(npz_files["npz_feature_mapping_path"]),
+        use_features=True,
+        load_masks_and_indices=True,
+    )
+    (
+        filenames,
+        indices,
+        inputs,
+        outputs,
+        inputs_features,
+        outputs_features,
+        subset_is_train,
+        _,
+        _,
+        _,
+    ) = result
+
+    # Filter by train subset
+    (
+        train_inputs,
+        train_outputs,
+        train_inputs_features,
+        train_outputs_features,
+        train_indices,
+    ) = filter_by_subset(
+        inputs,
+        outputs,
+        subset_is_train,
+        use_train_subset=True,
+        inputs_features=inputs_features,
+        outputs_features=outputs_features,
+        indices=indices,
+    )
+
+    # Should get examples 0 and 2 (subset_is_train = [True, False, True])
+    assert train_inputs.shape[0] == 2
+    assert train_indices == [0, 1]  # Original indices [0, 0, 1] filtered to [0, 1]
+
+    # Filter by test subset
+    (
+        test_inputs,
+        test_outputs,
+        test_inputs_features,
+        test_outputs_features,
+        test_indices,
+    ) = filter_by_subset(
+        inputs,
+        outputs,
+        subset_is_train,
+        use_train_subset=False,
+        inputs_features=inputs_features,
+        outputs_features=outputs_features,
+        indices=indices,
+    )
+
+    # Should get example 1 only
+    assert test_inputs.shape[0] == 1
+    assert test_indices == [0]  # Original index 0 from position 1
+
+
+def test_prepare_dataset_with_filename_filter(npz_files):
+    """Test prepare_dataset with filename filtering and indices."""
+    inputs, outputs, inputs_features, outputs_features, indices = prepare_dataset(
+        str(npz_files["npz_path"]), filter_filename="file1.json", use_features=False
+    )
+
+    # Should get 2 examples (file1.json appears at positions 0 and 2)
+    assert inputs.shape[0] == 2
+    assert outputs.shape[0] == 2
+    assert indices.shape == (2,)
+    assert indices.tolist() == [0, 1]  # Original indices [0, 0, 1] filtered to [0, 1]
+
+
+def test_prepare_dataset_with_limit(npz_files):
+    """Test prepare_dataset with example limiting and indices."""
+    inputs, outputs, inputs_features, outputs_features, indices = prepare_dataset(
+        str(npz_files["npz_path"]), limit_examples=2, use_features=False
+    )
+
+    # Should get first 2 examples
+    assert inputs.shape[0] == 2
+    assert outputs.shape[0] == 2
+    assert indices.shape == (2,)
+    assert indices.tolist() == [0, 0]  # First 2 from original [0, 0, 1]
+
+
+def test_create_dataloader_without_indices(npz_files):
+    """Test DataLoader creation without providing indices (should create defaults)."""
+    inputs, outputs, _, _, _ = prepare_dataset(
+        str(npz_files["npz_path"]), use_features=False
+    )
+
+    # Create dataloader without passing indices
+    dataloader = create_dataloader(
+        inputs, outputs, batch_size=2, shuffle=False, num_workers=0
+    )
+
+    # Test that we can iterate through the dataloader
+    batches = list(dataloader)
+    assert len(batches) == 2  # 3 examples, batch_size=2 -> 2 batches
+
+    # Check first batch
+    batch = batches[0]
+    assert len(batch) == 5
+    (
+        batch_inputs,
+        batch_outputs,
+        batch_features_in,
+        batch_features_out,
+        batch_indices,
+    ) = batch
+
+    # Should have default sequential indices
+    assert batch_indices.tolist() == [0, 1]  # Sequential defaults
+
+
+def test_create_dataloader_indices_propagation(npz_files):
+    """Test that indices are correctly propagated through DataLoader."""
+    inputs, outputs, _, _, indices = prepare_dataset(
+        str(npz_files["npz_path"]), use_features=False
+    )
+
+    dataloader = create_dataloader(
+        inputs, outputs, batch_size=3, shuffle=False, num_workers=0, indices=indices
+    )
+
+    # Get all examples in one batch
+    batches = list(dataloader)
+    assert len(batches) == 1
+
+    batch = batches[0]
+    (
+        batch_inputs,
+        batch_outputs,
+        batch_features_in,
+        batch_features_out,
+        batch_indices,
+    ) = batch
+
+    # Should preserve original indices
+    assert batch_indices.tolist() == [0, 0, 1]  # Original indices from test data
 
 
 def test_load_feature_mapping_dataloader_basic(npz_files):
@@ -505,3 +710,73 @@ def test_load_feature_mapping_dataloader_missing_data_error(npz_files):
     # Test with NPZ file that has features but no masks
     with pytest.raises(ValueError, match="Feature mapping requires mask data"):
         load_feature_mapping_dataloader(str(npz_files["npz_features_path"]))
+
+
+def test_end_to_end_indices_integration(npz_files, test_data):
+    """Test complete end-to-end indices propagation mimicking ex29.py usage."""
+    # Simulate ex29.py data loading pattern
+    (
+        train_inputs,
+        train_outputs,
+        train_input_features,
+        train_output_features,
+        train_indices,
+    ) = prepare_dataset(
+        str(npz_files["npz_features_path"]),
+        filter_filename="file1.json",
+        use_features=True,
+        dataset_name="train",
+    )
+
+    # Should get 2 examples (file1.json appears at positions 0 and 2)
+    assert train_inputs.shape[0] == 2
+    assert train_indices.tolist() == [
+        0,
+        1,
+    ]  # Original indices [0, 0, 1] filtered to [0, 1]
+
+    # Create dataloader like ex29.py does
+    train_loader = create_dataloader(
+        train_inputs,
+        train_outputs,
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        inputs_features=train_input_features,
+        outputs_features=train_output_features,
+        indices=train_indices,
+    )
+
+    # Simulate batch processing like in ex29.py
+    for batch_idx, batch in enumerate(train_loader):
+        # Unpack batch like ex29.py does
+        inputs_one_hot, outputs_one_hot, input_features, output_features, indices = (
+            batch
+        )
+
+        # Verify batch structure
+        assert len(batch) == 5
+        assert inputs_one_hot.shape == (2, 30, 30, 11)
+        assert outputs_one_hot.shape == (2, 30, 30, 11)
+        assert input_features.shape == (2, 30, 30, 44)
+        assert output_features.shape == (2, 30, 30, 44)
+        assert indices.shape == (2,)
+        assert indices.dtype == torch.long
+
+        # Verify indices match expected values
+        assert indices.tolist() == [0, 1]
+
+        # Simulate ex29.py batch_to_dataclass pattern
+        # Extract colors and create mock batch objects
+        input_colors = inputs_one_hot.argmax(dim=-1).long()
+        output_colors = outputs_one_hot.argmax(dim=-1).long()
+
+        # Verify we can access indices for each example
+        for example_idx, original_npz_idx in enumerate(indices):
+            print(
+                f"Example {example_idx} came from NPZ index {original_npz_idx.item()}"
+            )
+
+        # Should only have one batch due to batch_size=2 and 2 examples
+        assert batch_idx == 0
+        break
