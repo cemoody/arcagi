@@ -24,6 +24,7 @@ dependencies = [
     "pyarrow>=20.0.0",
     "imageio",
     "imageio[ffmpeg]",
+    "pydanclick>=0.5.1",
 ]
 
 [dependency-groups]
