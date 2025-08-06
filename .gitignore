@@ -19,3 +19,4 @@ optimized_checkpoints
 main_mapping_checkpoints
 color_mapping_outputs
 checkpoints_*/
+*checkpoints*/

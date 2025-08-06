@@ -79,13 +79,19 @@ class TestTrainingIndexMetrics:
 
         # First example (idx=5): 3 active pixels, 1 color incorrect within mask, 0 mask incorrect
         assert result[5]["input_n_masked_pixels"] == 3.0
-        assert result[5]["input_n_incorrect_num_color"] == 1.0  # Only the pixel at [0,0,1]
+        assert (
+            result[5]["input_n_incorrect_num_color"] == 1.0
+        )  # Only the pixel at [0,0,1]
         assert result[5]["input_n_incorrect_num_mask"] == 0.0
 
         # Second example (idx=10): 3 active pixels, 0 color incorrect within mask, 1 mask incorrect
         assert result[10]["input_n_masked_pixels"] == 3.0
-        assert result[10]["input_n_incorrect_num_color"] == 0.0  # Incorrect pixel at [1,1,0] is masked
-        assert result[10]["input_n_incorrect_num_mask"] == 1.0  # One incorrect mask prediction
+        assert (
+            result[10]["input_n_incorrect_num_color"] == 0.0
+        )  # Incorrect pixel at [1,1,0] is masked
+        assert (
+            result[10]["input_n_incorrect_num_mask"] == 1.0
+        )  # One incorrect mask prediction
 
     def test_duplicate_indices(self):
         """Test handling of duplicate indices in a batch."""
@@ -285,8 +291,12 @@ class TestTrainingIndexMetrics:
 
         # Should only count the 1 error inside the mask, not the 2 errors outside
         assert result[99]["input_n_masked_pixels"] == 2.0  # Two active pixels
-        assert result[99]["input_n_incorrect_num_color"] == 1.0  # Only 1 error inside mask
-        assert result[99]["input_n_incorrect_num_mask"] == 0.0  # All mask predictions correct
+        assert (
+            result[99]["input_n_incorrect_num_color"] == 1.0
+        )  # Only 1 error inside mask
+        assert (
+            result[99]["input_n_incorrect_num_mask"] == 0.0
+        )  # All mask predictions correct
 
 
 if __name__ == "__main__":
