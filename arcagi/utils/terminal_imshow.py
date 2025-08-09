@@ -80,7 +80,6 @@ def imshow(
         for val in row:
             if isinstance(val, int) and val != -1:  # Ignore background
                 unique_values.add(val)
-
     # Print each row of the matrix
     for row_idx, row in enumerate(matrix_list):
         row_str = ""
@@ -94,28 +93,27 @@ def imshow(
                 # Background (use space with black background)
                 # Using 3 spaces to match the width of " NN " format
                 if is_incorrect:
-                    row_str += f"{bold}{underline}\033[40m   {reset}"
+                    row_str += f"{bold}{underline}\033[40m    {reset}"
                 else:
-                    row_str += f"\033[40m   {reset}"
+                    row_str += f"\033[40m    {reset}"
             else:
                 # Get the appropriate color based on value
                 val_int = int(val)
-                color_idx = val_int % len(colors)
-                # Format to ensure consistent width with spaces on both sides
-                # Single digit numbers: " N " (3 chars), double digits: "NN " (3 chars)
-                if val_int < 10:
-                    if is_incorrect:
-                        # Use brackets around incorrect predictions for clear visibility
-                        row_str += f"{colors[color_idx]}[{val_int}]{reset}"
-                    else:
-                        row_str += f"{colors[color_idx]} {val_int} {reset}"
-                else:
-                    if is_incorrect:
-                        # Use brackets around incorrect predictions for clear visibility
-                        row_str += f"{colors[color_idx]}[{val_int}]{reset}"
-                    else:
-                        row_str += f"{colors[color_idx]}{val_int} {reset}"
+                abs_val = abs(val_int)
+                color_idx = abs_val % len(colors)
 
+                # Create the display value with sign if negative
+                if val_int < 0:
+                    display_val = f"-{abs_val:>1}"
+                else:
+                    display_val = f" {abs_val:>1}"
+
+                # Format to ensure consistent width (3 characters total)
+                if is_incorrect:
+                    # Use brackets around incorrect predictions for clear visibility
+                    row_str += f"{colors[color_idx]}[{display_val:>2}]{reset}"
+                else:
+                    row_str += f"{colors[color_idx]} {display_val:>2} {reset}"
         print(row_str)
 
     # Display legend if requested

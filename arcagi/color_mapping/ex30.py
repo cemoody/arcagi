@@ -9,6 +9,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 from pydanclick import from_pydantic
 from pydantic import BaseModel
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
@@ -159,6 +160,25 @@ def batch_to_dataclass(
     return BatchData(inp=inp, out=out)
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    More efficient than LayerNorm for recurrent architectures like message-passing networks.
+    Used in modern LLMs like Llama for better performance.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMS normalization: x / sqrt(mean(x^2) + eps)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        return self.weight * x_normed
+
+
 class Order2ToColorDecoder(nn.Module):
     """
     Decoder network that converts order2 features back to color predictions.
@@ -175,15 +195,15 @@ class Order2ToColorDecoder(nn.Module):
         # Hidden layers to process and decode
         self.decoder = nn.Sequential(
             nn.Linear(44, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            RMSNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            RMSNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            RMSNorm(hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
         )
@@ -235,7 +255,7 @@ class Order2MemorizationModel(pl.LightningModule):
     def __init__(
         self,
         feature_dim: int = 147,  # Not used in this version
-        hidden_dim: int = 512,
+        hidden_dim: int = 64,
         num_message_rounds: int = 6,
         num_classes: int = 10,
         dropout: float = 0.0,
@@ -245,7 +265,7 @@ class Order2MemorizationModel(pl.LightningModule):
         filename: str = "3345333e",
         num_train_examples: int = 2,
         dim_nca: int = 64,  # Increased for 44-channel input
-        decoder_hidden_dim: int = 256,
+        decoder_hidden_dim: int = 64,
         # Self-healing noise parameters
         enable_self_healing: bool = True,
         death_prob: float = 0.02,
@@ -282,9 +302,9 @@ class Order2MemorizationModel(pl.LightningModule):
         # Convert 44 binary features to hidden dimension
         self.feature_processor = nn.Sequential(
             nn.Linear(44, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            RMSNorm(hidden_dim),
             nn.GELU(),
-            nn.LayerNorm(hidden_dim),
+            # Removed redundant second normalization layer
         )
 
         # Binary noise layer for training-time regularization
@@ -320,6 +340,8 @@ class Order2MemorizationModel(pl.LightningModule):
         # Store available colors
         self.available_colors: Optional[List[int]] = None
 
+        self.drop = nn.Dropout(dropout)
+
         # Better initialization
         self._init_weights()
 
@@ -349,75 +371,45 @@ class Order2MemorizationModel(pl.LightningModule):
             mask_logits: [B, 30, 30, 1]
         """
         # Step 1: Convert colors to order2 features
-        order2_features = self.order2_encoder(colors)  # [B, 30, 30, 44]
+        with torch.no_grad():
+            order2_features = self.order2_encoder(colors)  # [B, 30, 30, 44]
 
-        # Apply binary noise during training
-        order2_features = apply_binary_noise(
-            order2_features, noise_prob=self.noise_prob, training=self.training
-        )
+            # Apply binary noise during training
+            order2_features = apply_binary_noise(
+                order2_features, noise_prob=self.noise_prob, training=self.training
+            )
 
         # Step 2: Process order2 features
         h = self.feature_processor(order2_features)  # [B, 30, 30, hidden_dim]
 
-        # Hybrid NCA and Message Passing processing
-        x = self.linear_1(h)
-
-        # Phase 1: Steps with self-healing noise (for robustness training)
+        # Step 3: Hybrid NCA and Message Passing processing
         noisy_steps = self.num_message_rounds - self.nca.num_final_steps
-        for i in range(max(0, noisy_steps)):
-            # Neural Cellular Automata
-            x = x + self.nca(x, apply_noise=True)
+        for i in range(max(0, noisy_steps + self.nca.num_final_steps)):
+            apply_noise = i < noisy_steps
+            p = self.dropout if apply_noise else 0
+            # Project to NCA dimension (but keep residual)
+            x_nca = self.linear_1(h)
+            if apply_noise:
+                x_nca = self.drop(x_nca)
 
-            # Convert back to full hidden_dim for message passing
-            h_temp = h + self.linear_2(x)
+            # Neural Cellular Automata with residual
+            x_nca = x_nca + self.nca(x_nca, apply_noise=apply_noise)
 
-            # Spatial message passing
-            h_messages = self.message_passing(h_temp)
+            # Project back and add as residual to h
+            h_update = self.linear_2(x_nca)
+            if apply_noise:
+                h_update = self.drop(h_update)
+            h = h + h_update  # Small weight on NCA update
 
-            # Residual connection
-            alpha = 0.3
-            h = h + alpha * h_messages
+            # Spatial message passing on current h
+            h_messages = self.message_passing(h)
+            h = h + h_messages  # Residual connection for messages
 
-            # Update x for next NCA iteration
-            x = self.linear_1(h)
-
-        # Phase 2: Final steps without noise (for self-cleaning)
-        for i in range(min(self.nca.num_final_steps, self.num_message_rounds)):
-            # Neural Cellular Automata (no noise)
-            x = x + self.nca(x, apply_noise=False)
-
-            # Convert back to full hidden_dim for message passing
-            h_temp = h + self.linear_2(x)
-
-            # Spatial message passing
-            h_messages = self.message_passing(h_temp)
-
-            # Residual connection
-            alpha = 0.3
-            h = h + alpha * h_messages
-
-            # Update x for next NCA iteration (if not last step)
-            if i < min(self.nca.num_final_steps, self.num_message_rounds) - 1:
-                x = self.linear_1(h)
-
-        # Final projection
-        h = h + self.linear_2(x)
-
-        # Step 3: Reconstruct order2 features from processed hidden state
-        reconstructed_order2 = self.order2_projection(h)
-
-        # Apply sigmoid to get binary-like features
-        reconstructed_order2 = torch.sigmoid(reconstructed_order2)
-
-        # Step 4: Decode order2 features to colors and masks
-        color_logits, mask_logits = self.order2_decoder(reconstructed_order2)
-
-        # Temperature scaling for colors
+        # Step 4: Reconstruct order2 features from processed hidden state
+        signal = self.order2_projection(h)
+        color_logits, mask_logits = self.order2_decoder(signal)
         color_logits = color_logits / self.temperature
-
-        # Apply color constraints
         color_logits = apply_color_constraints(color_logits, self.available_colors)
-
         return color_logits, mask_logits
 
     def training_step(
@@ -505,6 +497,10 @@ class Order2MemorizationModel(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         """Print training per-index accuracy at the end of each epoch."""
         self.epoch_end("train")
+
+    def on_train_epoch_start(self) -> None:
+        # logger.info(f"Training epoch start: {self.current_epoch}")
+        pass
 
     def on_validation_epoch_start(self) -> None:
         """Reset validation metrics at the start of each epoch."""
@@ -682,7 +678,7 @@ class SpatialMessagePassing(nn.Module):
             groups=hidden_dim // 16,  # Group convolution for efficiency
         )
 
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = RMSNorm(hidden_dim)
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 

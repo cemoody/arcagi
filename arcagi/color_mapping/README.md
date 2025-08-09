@@ -1,6 +1,6 @@
-# Color Mapping Experiments
+# End-to-End ARC-AGI Models
 
-This directory contains experiments for learning color mappings from ARC-AGI data.
+This directory contains full end-to-end neural models for solving ARC-AGI tasks. These models take input grids and directly predict output grids, learning both the spatial transformations and color mappings required to solve the tasks.
 
 ## Experiments
 
@@ -640,4 +640,47 @@ For proper train/test generalization:
 13. **Perfect generalization is achievable**: ex25/ex26/ex28.py prove that with the right architecture, 100% accuracy is possible even with proper train/test splits
 14. **Scalability excellence**: Sequential NCA+MP architecture scales from 1.3M params (ex25) down to 24.6K params (ex27/ex28) while maintaining 99.7%+ accuracy
 15. **Hidden dimension sweet spot**: 64 dimensions appear optimal for parameter/accuracy balance in this architectural family
-16. **Data augmentation scaling**: ex28.py shows 40 augmented examples (vs 8 base) can achieve near-perfect memorization with enhanced spatial robustness 
+16. **Data augmentation scaling**: ex28.py shows 40 augmented examples (vs 8 base) can achieve near-perfect memorization with enhanced spatial robustness
+
+### ex29.py - Order2 Feature to Color Prediction Model
+- **Architecture Innovation**: Uses Order2 features from `lib/order2.py` as input to predict colors
+- **Key Components**:
+  - **Order2 Features**: 44 binary features capturing spatial relationships (pairwise comparisons + mask features)
+  - **Feature Processing**: Projects Order2 features to hidden dimension for processing
+  - **Neural Cellular Automata**: Self-healing NCA with learnable perception filters
+  - **Spatial Message Passing**: Local consistency through 3x3 convolutions
+  - **Dual Prediction**: Separate heads for color and mask predictions
+- **Training Configuration**:
+  - Hidden dimension: 64-512 (configurable)
+  - Message rounds: 24 (configurable)
+  - Self-healing noise during training for robustness
+  - Two-phase processing: noisy steps followed by clean steps
+- **Results on `28e73c20`**:
+  - Successfully learns to predict colors from Order2 features
+  - Training loss decreases from ~2.0 to ~1.3-1.4
+  - Demonstrates that Order2 features contain sufficient information for color prediction
+
+### ex30.py - Order2 to Order2 to Color End-to-End Model
+- **Architecture Innovation**: Full end-to-end model using Order2 features as intermediate representation
+- **Processing Pipeline**:
+  1. **Encode**: Colors → Order2 features (using `Order2Features` from `lib/order2.py`)
+  2. **Process**: Order2 features → Processed Order2 features (via NCA + Message Passing)
+  3. **Decode**: Processed Order2 features → Colors + Masks
+- **Key Differences from ex29**:
+  - Takes raw color inputs instead of pre-computed Order2 features
+  - Learns to encode colors to Order2, process them, and decode back to colors
+  - End-to-end differentiable pipeline with Order2 as bottleneck
+- **Architecture Components**:
+  - **Order2 Encoder**: Converts input colors to 44 binary features per pixel
+  - **Feature Processor**: Hidden layers + NCA + Message Passing
+  - **Order2 Projection**: Linear layer to reconstruct Order2 features
+  - **Order2 Decoder**: Network to convert Order2 features back to colors/masks
+- **Training Results on `28e73c20`**:
+  - Model successfully learns the full pipeline
+  - Training loss decreases steadily, showing the model is learning
+  - Demonstrates that Order2 features can serve as an effective intermediate representation
+  - The binary nature of Order2 features acts as a useful bottleneck/regularization
+- **Key Insights**:
+  - Order2 features capture essential spatial relationships needed for ARC-AGI tasks
+  - Using Order2 as intermediate representation provides interpretable features
+  - The encode-process-decode pipeline with Order2 bottleneck is a viable architecture 
