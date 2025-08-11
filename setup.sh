@@ -33,12 +33,29 @@ if command -v uv &> /dev/null; then
     echo "uv is already installed ($(uv --version))"
 else
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source $HOME/.cargo/env  # Add uv to PATH
+    # Add uv to PATH if cargo env file exists
+    if [ -f "$HOME/.cargo/env" ]; then
+        source $HOME/.cargo/env
+    fi
 fi
 
 # Ensure uv is in PATH for this session
 if ! command -v uv &> /dev/null; then
-    export PATH="$HOME/.cargo/bin:$PATH"
+    # Try both common installation paths
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    # Also source cargo env if it exists
+    if [ -f "$HOME/.cargo/env" ]; then
+        source "$HOME/.cargo/env"
+    fi
+fi
+
+# Verify uv is now available
+if ! command -v uv &> /dev/null; then
+    echo "Error: uv installation failed or not in PATH"
+    echo "uv may have been installed to ~/.local/bin or ~/.cargo/bin"
+    echo "Try: export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\""
+    echo "Then check: uv --version"
+    exit 1
 fi
 
 # Verify CUDA is available (for GPU instances)
@@ -52,7 +69,7 @@ fi
 
 # Clone the repository
 echo "5. Setting up repository..."
-PROJECT_DIR="$HOME/arcagi/arcagi"
+PROJECT_DIR="$HOME/arcagi"
 
 # Check if repository already exists and is valid
 if [ -d "$PROJECT_DIR/.git" ]; then
@@ -93,12 +110,10 @@ case $auth_choice in
         ssh -T git@github.com || true
         
         REPO_URL="git@github.com:cemoody/arcagi.git"
-        # Note: This will clone to $HOME/arcagi, then we cd to $HOME/arcagi/arcagi
         ;;
     2)
         read -p "Enter your GitHub personal access token: " token
         REPO_URL="https://$token@github.com/cemoody/arcagi.git"
-        # Note: This will clone to $HOME/arcagi, then we cd to $HOME/arcagi/arcagi
         ;;
     3)
         echo "Skipping repository clone. You'll need to clone manually:"
@@ -161,7 +176,7 @@ if ! command -v wandb &> /dev/null; then
 fi
 
 # Check if wandb is already configured
-if wandb status &> /dev/null; then
+if command -v wandb &> /dev/null && wandb status &> /dev/null; then
     echo "wandb is already configured and logged in"
     wandb_choice="existing"
 else
@@ -256,11 +271,11 @@ else
 fi
 # Set up uv in bash profile for persistent access
 echo "12. Setting up uv in bash profile..."
-UV_PATH_LINE='export PATH="$HOME/.cargo/bin:$PATH"'
-CARGO_ENV_LINE='source "$HOME/.cargo/env"'
+UV_PATH_LINE='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
+CARGO_ENV_LINE='[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"'
 
 # Add to .bashrc if not already present
-if ! grep -q "\.cargo/bin" ~/.bashrc 2>/dev/null; then
+if ! grep -q "\.local/bin\|\.cargo/bin" ~/.bashrc 2>/dev/null; then
     echo "Adding uv to .bashrc..."
     echo "# Added by arcagi setup script" >> ~/.bashrc
     echo "$UV_PATH_LINE" >> ~/.bashrc
@@ -284,7 +299,7 @@ fi
 EOF
 fi
 
-if ! grep -q "\.cargo/bin" ~/.bash_profile 2>/dev/null; then
+if ! grep -q "\.local/bin\|\.cargo/bin" ~/.bash_profile 2>/dev/null; then
     echo "Adding uv to .bash_profile..."
     echo "# Added by arcagi setup script" >> ~/.bash_profile
     echo "$UV_PATH_LINE" >> ~/.bash_profile
