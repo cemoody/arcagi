@@ -41,7 +41,7 @@ class TestOrder2Features:
         for B, H, W in test_cases:
             x = torch.randint(0, 10, (B, H, W))
             output = transform(x)
-            assert output.shape == (B, H, W, 44), f"Wrong shape for input {(B, H, W)}"
+            assert output.shape == (B, H, W, 45), f"Wrong shape for input {(B, H, W)}"
 
     def test_binary_output(self, transform):
         """Test that all output values are binary (0 or 1)."""
@@ -76,13 +76,13 @@ class TestOrder2Features:
 
             # Compute features with PyTorch implementation
             grid_torch = torch.from_numpy(grid_np).unsqueeze(0)  # Add batch dimension
-            features_torch = (
+            features_torch_full = (
                 transform(grid_torch).squeeze(0).numpy()
             )  # Remove batch dimension
 
-            # Compare results
+            # Compare only the first 44 features to the numpy implementation
             np.testing.assert_array_equal(
-                features_torch,
+                features_torch_full[..., :44],
                 features_np,
                 err_msg=f"Mismatch for grid shape {grid_np.shape}",
             )
@@ -119,7 +119,7 @@ class TestOrder2Features:
 
         output = transform(x)
 
-        # Check center cell (1,1) mask features (last 8 features)
+        # Check center cell (1,1) mask features (positions 36:44)
         center_mask_features = output[0, 1, 1, 36:44]
 
         # The 8 neighbors of center are: [-1, 0, 1, 2, 4, 5, 6, -1]
@@ -127,6 +127,10 @@ class TestOrder2Features:
         # (0 for positions with -1, 1 for positions without -1)
         expected = torch.tensor([0, 1, 1, 1, 1, 1, 1, 0], dtype=torch.float32)
         torch.testing.assert_close(center_mask_features, expected)
+
+        # is_mask (last feature) should be 0 for center cell (not a mask)
+        center_is_mask = output[0, 1, 1, 44]
+        assert center_is_mask.item() == 0
 
     def test_boundary_handling(self, transform):
         """Test that boundaries are handled correctly (padded with -1)."""
@@ -157,7 +161,7 @@ class TestOrder2Features:
         output = transform(x)
 
         # Check shape
-        assert output.shape == (batch_size, 10, 10, 44)
+        assert output.shape == (batch_size, 10, 10, 45)
 
         # For uniform color grids, interior cells will have all 0s for pairwise features
         # But boundary cells will have some 1s due to padding with -1
@@ -231,7 +235,7 @@ class TestOrder2Features:
         # Test it works
         x = torch.randint(0, 10, (1, 5, 5))
         output = transform(x)
-        assert output.shape == (1, 5, 5, 44)
+        assert output.shape == (1, 5, 5, 45)
 
 
 class TestEdgeCases:
@@ -256,12 +260,16 @@ class TestEdgeCases:
             mask_features == 0
         ), "All neighbors should be detected as masks"
 
+        # is_mask feature (last feature) should be 1 everywhere
+        is_mask = output[..., 44]
+        assert torch.all(is_mask == 1), "Center cells should all be masks"
+
     def test_single_pixel(self, transform):
         """Test 1x1 input (all neighbors out of bounds)."""
         x = torch.tensor([[[5]]], dtype=torch.long)  # Need batch dimension
         output = transform(x)
 
-        assert output.shape == (1, 1, 1, 44)
+        assert output.shape == (1, 1, 1, 45)
 
         # All neighbors are out of bounds (-1)
         # So all pairwise comparisons with center (5) should be 1 (different)
@@ -277,7 +285,7 @@ class TestEdgeCases:
         output = transform(x)
 
         # Should work normally
-        assert output.shape == (1, 5, 5, 44)
+        assert output.shape == (1, 5, 5, 45)
         assert torch.all((output == 0) | (output == 1))
 
 

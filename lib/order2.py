@@ -13,12 +13,15 @@ Example usage:
     color_grids = torch.randint(-1, 10, (32, 30, 30))
 
     # Compute features
-    features = transform(color_grids)  # Output shape: [32, 30, 30, 44]
+    features = transform(color_grids)  # Output shape: [32, 30, 30, 45]
 
     # Features are binary (0 or 1):
     # - First 36 features: pairwise color comparisons in 3x3 neighborhood
-    # - Last 8 features: mask detection for each neighbor
+    # - Next 8 features: mask detection for each neighbor
+    # - Final feature: is_mask (whether the center cell is -1)
 """
+
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,37 +31,49 @@ import torch.nn.functional as F
 
 
 class Order2Features(nn.Module):
+    # Class-level annotations for registered buffers (helps static type checkers)
+    pair_idx1: torch.Tensor
+    pair_idx2: torch.Tensor
+    neighbor_indices: torch.Tensor
     """
     Computes order-2 (pairwise) relational features for color grids.
 
     For each cell in the input grid, this module computes:
     1. Pairwise color matching in 3x3 neighborhood (36 features)
     2. Center-to-neighbor mask detection (8 features)
+    3. is_mask: whether the center cell is a mask (-1) (1 feature)
 
-    Total: 44 binary features per cell
+    Total: 45 binary features per cell
 
     Input shape: [B, H, W] with integer color values (0-9) and -1 for mask
-    Output shape: [B, H, W, 44] with binary features (0 or 1)
+    Output shape: [B, H, W, 45] with binary features (0 or 1)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
+
+        # Type annotations for registered buffers (for type checkers)
+        self.pair_idx1: torch.Tensor
+        self.pair_idx2: torch.Tensor
+        self.neighbor_indices: torch.Tensor
 
         # Pre-compute pair indices for the 36 pairwise comparisons
         # These are all unique pairs from a 3x3 neighborhood (9 positions)
-        pairs: list[tuple[int, int]] = []
+        pairs: List[Tuple[int, int]] = []
         for i in range(9):
             for j in range(i + 1, 9):
                 pairs.append((i, j))
 
         # Convert to tensors for efficient indexing
-        pair_idx1 = torch.tensor([p[0] for p in pairs], dtype=torch.long)
-        pair_idx2 = torch.tensor([p[1] for p in pairs], dtype=torch.long)
+        pair_idx1: torch.Tensor = torch.tensor([p[0] for p in pairs], dtype=torch.long)
+        pair_idx2: torch.Tensor = torch.tensor([p[1] for p in pairs], dtype=torch.long)
         self.register_buffer("pair_idx1", pair_idx1)
         self.register_buffer("pair_idx2", pair_idx2)
 
         # Neighbor indices (all except center which is at position 4)
-        neighbor_indices = torch.tensor([0, 1, 2, 3, 5, 6, 7, 8], dtype=torch.long)
+        neighbor_indices: torch.Tensor = torch.tensor(
+            [0, 1, 2, 3, 5, 6, 7, 8], dtype=torch.long
+        )
         self.register_buffer("neighbor_indices", neighbor_indices)
 
     def extract_neighborhoods(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,8 +137,14 @@ class Order2Features(nn.Module):
         # Compute mask features (8 features)
         mask_features = self.compute_mask_features(neighborhoods)
 
-        # Concatenate all features
-        features = torch.cat([pairwise_features, mask_features], dim=-1)
+        # Compute is_mask for the center cell (1 if -1, else 0)
+        center_values = neighborhoods[..., 4]
+        is_mask_feature = (center_values == -1).float().unsqueeze(-1)
+
+        # Concatenate all features: 36 + 8 + 1 = 45
+        features = torch.cat(
+            [pairwise_features, mask_features, is_mask_feature], dim=-1
+        )
 
         return features
 

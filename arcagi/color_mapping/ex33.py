@@ -1,3 +1,4 @@
+import math
 import os
 
 # Import from parent module
@@ -248,11 +249,11 @@ class SelfHealingNoise(nn.Module):
         return h
 
 
-class NeuralCellularAutomata(nn.Module):
+class NeuralCellularAutomata2(nn.Module):
     def __init__(
-        self: "NeuralCellularAutomata",
+        self: "NeuralCellularAutomata2",
         hidden_dim: int,
-        dropout: float = 0.1,
+        dropout: float = 0.05,
         enable_self_healing: bool = True,
         death_prob: float = 0.02,
         gaussian_std: float = 0.05,
@@ -290,7 +291,10 @@ class NeuralCellularAutomata(nn.Module):
             nn.Dropout2d(dropout),
             nn.Conv2d(hidden_dim * 2, hidden_dim, 1),
         )
+        # Attention components (currently unused but available for future use)
+        self.lin_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
         self.update_probability = 0.5
+        self.drop = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
     def stochastic_update(
@@ -306,6 +310,149 @@ class NeuralCellularAutomata(nn.Module):
         return x + dx * update_mask
 
     @jaxtyped(typechecker=beartype)
+    def apply_local_spatial_attention(self, h: HiddenGrid) -> HiddenGrid:
+        """Apply local spatial attention within 3x3 neighborhoods - FAST VERSION."""
+        B, H, W, C = h.shape
+
+        # Generate Q, K, V
+        qkv = self.lin_qkv(h)  # [B, H, W, 3*C]
+        q, k, v = qkv.chunk(3, dim=-1)  # Each: [B, H, W, C]
+
+        # Convert to [B, C, H, W] for convolution operations
+        q = q.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        k = k.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        v = v.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+
+        # FAST METHOD 1: Depthwise Convolution-based Attention
+        # This is much faster than unfold/fold operations
+
+        # Pad the tensors for 3x3 neighborhoods
+        pad = 1
+        k_padded = F.pad(k, (pad, pad, pad, pad), mode="constant", value=0)
+        v_padded = F.pad(v, (pad, pad, pad, pad), mode="constant", value=0)
+
+        # Initialize attention output
+        h_attn = torch.zeros_like(v)
+
+        # Process each position in the 3x3 grid
+        positions = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 0),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
+        # Collect attention scores for all positions
+        scores_list = []
+        for dy, dx in positions:
+            # Extract shifted keys
+            k_shift = k_padded[:, :, pad + dy : pad + dy + H, pad + dx : pad + dx + W]
+            # Compute dot product attention scores
+            scores = (q * k_shift).sum(dim=1, keepdim=True) / math.sqrt(
+                C
+            )  # [B, 1, H, W]
+            scores_list.append(scores)
+
+        # Stack and normalize scores
+        scores = torch.cat(scores_list, dim=1)  # [B, 9, H, W]
+        attn_weights = F.softmax(scores, dim=1)  # [B, 9, H, W]
+
+        # Apply attention weights to values
+        for i, (dy, dx) in enumerate(positions):
+            v_shift = v_padded[:, :, pad + dy : pad + dy + H, pad + dx : pad + dx + W]
+            weight = attn_weights[:, i : i + 1, :, :]  # [B, 1, H, W]
+            h_attn = h_attn + weight * v_shift
+
+        # Convert back to [B, H, W, C]
+        h_attn = h_attn.permute(0, 2, 3, 1).contiguous()
+
+        return h_attn
+
+    @jaxtyped(typechecker=beartype)
+    def apply_local_spatial_attention_depthwise(self, h: HiddenGrid) -> HiddenGrid:
+        """Even faster version using depthwise separable convolutions."""
+        B, H, W, C = h.shape
+
+        # Generate Q, K, V
+        qkv = self.lin_qkv(h)  # [B, H, W, 3*C]
+        qkv = qkv.permute(0, 3, 1, 2)  # [B, 3*C, H, W]
+        q, k, v = qkv.chunk(3, dim=1)  # Each: [B, C, H, W]
+
+        # FAST METHOD 2: Single-pass depthwise convolution
+        # Approximate local attention with learned 3x3 kernels
+
+        # Instead of computing explicit attention, use depthwise conv
+        # This is an approximation but much faster
+        if not hasattr(self, "local_attn_conv"):
+            # Create depthwise conv layers on first use
+            self.local_attn_conv = nn.Conv2d(
+                self.hidden_dim * 3,
+                self.hidden_dim,
+                kernel_size=3,
+                padding=1,
+                groups=self.hidden_dim,
+            )
+            # Initialize with small weights
+            nn.init.xavier_uniform_(self.local_attn_conv.weight, gain=0.1)
+
+        # Concatenate q, k, v and apply depthwise convolution
+        qkv_concat = torch.cat([q, k, v], dim=1)  # [B, 3*C, H, W]
+        h_attn = self.local_attn_conv(qkv_concat)  # [B, C, H, W]
+
+        # Apply activation and convert back
+        h_attn = F.gelu(h_attn)
+        h_attn = h_attn.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+
+        return h_attn
+
+    @jaxtyped(typechecker=beartype)
+    def apply_local_spatial_attention_im2col(self, h: HiddenGrid) -> HiddenGrid:
+        """Fastest version using im2col-style operations with batch matrix multiplication."""
+        B, H, W, C = h.shape
+
+        # Generate Q, K, V
+        qkv = self.lin_qkv(h)  # [B, H, W, 3*C]
+        q, k, v = qkv.chunk(3, dim=-1)  # Each: [B, H, W, C]
+
+        # Reshape to [B*H*W, C] for efficient processing
+        q_flat = q.reshape(B * H * W, C)  # [B*H*W, C]
+
+        # Convert to [B, C, H, W] for unfold
+        k = k.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        v = v.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+
+        # Use unfold for k and v (this is optimized in PyTorch)
+        k_unfold = F.unfold(k, kernel_size=3, padding=1)  # [B, C*9, H*W]
+        v_unfold = F.unfold(v, kernel_size=3, padding=1)  # [B, C*9, H*W]
+
+        # Reshape for batch matrix multiplication
+        k_unfold = k_unfold.transpose(1, 2).reshape(B * H * W, C, 9)  # [B*H*W, C, 9]
+        v_unfold = v_unfold.transpose(1, 2).reshape(B * H * W, C, 9)  # [B*H*W, C, 9]
+
+        # Compute attention scores using batch matrix multiplication
+        # [B*H*W, 1, C] @ [B*H*W, C, 9] -> [B*H*W, 1, 9]
+        scores = torch.bmm(q_flat.unsqueeze(1), k_unfold) / math.sqrt(C)
+        scores = scores.squeeze(1)  # [B*H*W, 9]
+
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)  # [B*H*W, 9]
+
+        # Apply attention to values
+        # [B*H*W, 1, 9] @ [B*H*W, 9, C] -> [B*H*W, 1, C]
+        v_unfold = v_unfold.transpose(1, 2)  # [B*H*W, 9, C]
+        h_attn = torch.bmm(attn_weights.unsqueeze(1), v_unfold)  # [B*H*W, 1, C]
+
+        # Reshape back to spatial dimensions
+        h_attn = h_attn.squeeze(1).reshape(B, H, W, C)  # [B, H, W, C]
+
+        return h_attn
+
+    @jaxtyped(typechecker=beartype)
     def forward(self, h: HiddenGrid, apply_noise: bool = True) -> HiddenGrid:
         if apply_noise and self.self_healing_noise is not None:
             h = self.self_healing_noise(h)
@@ -314,6 +461,13 @@ class NeuralCellularAutomata(nn.Module):
         dx = self.update_net(perceived)
         x_new = self.stochastic_update(x, dx)
         h_new = x_new.permute(0, 2, 3, 1).contiguous()
+
+        # Apply local spatial attention (using fastest method)
+        h_attn = self.apply_local_spatial_attention_im2col(h_new)
+
+        # Residual connection with attention
+        h_new = h_new + self.drop(h_attn)
+
         return h_new
 
 
@@ -328,7 +482,7 @@ class TrainingConfig(BaseModel):
     max_epochs: int = 2000
     lr: float = 0.005
     weight_decay: float = 1e-4
-    hidden_dim: int = 512
+    hidden_dim: int = 64
     num_message_rounds: int = 24
 
     # Self-healing noise parameters
@@ -479,7 +633,7 @@ class MainModel(pl.LightningModule):
         self.linear_1 = nn.Linear(hidden_dim, dim_nca)
         self.linear_2 = nn.Linear(dim_nca, hidden_dim)
 
-        self.nca = NeuralCellularAutomata(
+        self.nca = NeuralCellularAutomata2(
             hidden_dim,
             dropout=dropout,
             enable_self_healing=enable_self_healing,
@@ -523,6 +677,7 @@ class MainModel(pl.LightningModule):
             # if apply_noise:
             #     x_nca = self.drop(x_nca)
             h = h + self.nca(h, apply_noise=apply_noise)
+            h = h + self.message_passing(h)
             # signal = self.order2_projection(h)
         #     h_update = self.linear_2(x_nca)
         #     if apply_noise:
@@ -956,7 +1111,7 @@ def main(training_config: TrainingConfig):
         "hyperparameters": hyperparams,
     }
 
-    torch.save(model_save_data, final_moel_path)
+    torch.save(model_save_data, final_model_path)
     print(f"\nFinal model saved to: {final_model_path}")
 
 
