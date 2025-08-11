@@ -52,7 +52,7 @@ fi
 
 # Clone the repository
 echo "5. Setting up repository..."
-PROJECT_DIR="$HOME/arcagi"
+PROJECT_DIR="$HOME/arcagi/arcagi"
 
 # Check if repository already exists and is valid
 if [ -d "$PROJECT_DIR/.git" ]; then
@@ -93,10 +93,12 @@ case $auth_choice in
         ssh -T git@github.com || true
         
         REPO_URL="git@github.com:cemoody/arcagi.git"
+        # Note: This will clone to $HOME/arcagi, then we cd to $HOME/arcagi/arcagi
         ;;
     2)
         read -p "Enter your GitHub personal access token: " token
         REPO_URL="https://$token@github.com/cemoody/arcagi.git"
+        # Note: This will clone to $HOME/arcagi, then we cd to $HOME/arcagi/arcagi
         ;;
     3)
         echo "Skipping repository clone. You'll need to clone manually:"
@@ -111,13 +113,14 @@ esac
 
 # Clone repository if needed (only for new setups)
 if [ "$auth_choice" != "existing" ] && [ "$auth_choice" != "3" ]; then
-    if [ ! -d "$PROJECT_DIR" ]; then
+    if [ ! -d "$HOME/arcagi" ]; then
         echo "Cloning repository..."
-        git clone "$REPO_URL" "$PROJECT_DIR"
-        cd "$PROJECT_DIR"
-    else
-        cd "$PROJECT_DIR"
+        git clone "$REPO_URL" "$HOME/arcagi"
     fi
+    cd "$PROJECT_DIR"
+else
+    # For existing repos, make sure we're in the right directory
+    cd "$PROJECT_DIR"
 fi
 
 # Set up Python environment with uv
@@ -136,13 +139,26 @@ fi
 echo "7. Installing project dependencies..."
 if [ -f "pyproject.toml" ]; then
     echo "Installing/updating dependencies with uv sync..."
-    uv sync
+    if ! uv sync; then
+        echo "Error: Failed to install dependencies with uv sync"
+        echo "This might be due to dependency conflicts or network issues"
+        echo "Trying to install basic requirements manually..."
+        uv pip install torch torchvision torchaudio wandb --index-url https://download.pytorch.org/whl/cu121
+    fi
 else
-    echo "Warning: No pyproject.toml found, skipping dependency installation"
+    echo "Warning: No pyproject.toml found, installing basic requirements..."
+    echo "Installing PyTorch with CUDA support and wandb..."
+    uv pip install torch torchvision torchaudio wandb --index-url https://download.pytorch.org/whl/cu121
 fi
 
 # Set up Weights & Biases
 echo "8. Setting up Weights & Biases (wandb)..."
+
+# Ensure wandb is available (install if needed)
+if ! command -v wandb &> /dev/null; then
+    echo "wandb not found, installing with uv..."
+    uv pip install wandb
+fi
 
 # Check if wandb is already configured
 if wandb status &> /dev/null; then
@@ -176,11 +192,23 @@ esac
 
 # Verify PyTorch can see GPU
 echo "9. Verifying PyTorch GPU access..."
+
+# Ensure PyTorch is available (install if needed)
+if ! python -c "import torch" &> /dev/null; then
+    echo "PyTorch not found, installing with CUDA support..."
+    # Install PyTorch with CUDA support for GPU instances
+    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+fi
+
+# Ensure we're in the virtual environment
+source .venv/bin/activate
 python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA device count: {torch.cuda.device_count()}')"
 
 # Verify wandb setup
 echo "10. Verifying wandb setup..."
 if [ "$wandb_choice" != "3" ]; then
+    # Ensure we're in the virtual environment
+    source .venv/bin/activate
     python -c "import wandb; print(f'wandb version: {wandb.__version__}'); print('wandb setup verified')"
 else
     echo "wandb setup was skipped"
@@ -188,28 +216,94 @@ fi
 
 # Set up auto-shutdown after 3 hours
 echo "11. Setting up auto-shutdown (3 hours)..."
+
+# Install and start the at daemon if not available
+if ! command -v at &> /dev/null; then
+    echo "Installing at daemon for scheduling..."
+    sudo apt-get update -qq
+    sudo apt-get install -y at
+fi
+
+# Ensure atd service is running
+if ! systemctl is-active --quiet atd; then
+    echo "Starting at daemon..."
+    sudo systemctl enable atd
+    sudo systemctl start atd
+fi
+
+# Schedule the shutdown
 if atq | grep -q "shutdown"; then
     echo "Auto-shutdown is already scheduled:"
     atq | grep "shutdown"
 else
     echo "sudo shutdown -h +180" | at now
-    echo "Auto-shutdown scheduled for 3 hours from now"
+    if [ $? -eq 0 ]; then
+        echo "Auto-shutdown scheduled for 3 hours from now"
+    else
+        echo "Failed to schedule with 'at', falling back to manual reminder"
+        echo "To manually shutdown in 3 hours, run: sudo shutdown -h +180"
+    fi
 fi
 
 echo ""
 echo "=== Setup Complete! ==="
 echo ""
-if atq | grep -q "shutdown"; then
+if command -v atq &> /dev/null && atq | grep -q "shutdown"; then
     echo "Auto-shutdown: Instance will shut down based on scheduled task"
     echo "To cancel shutdown: sudo shutdown -c"
 else
-    echo "No auto-shutdown scheduled"
+    echo "No auto-shutdown scheduled (or 'at' daemon not available)"
 fi
+# Set up uv in bash profile for persistent access
+echo "12. Setting up uv in bash profile..."
+UV_PATH_LINE='export PATH="$HOME/.cargo/bin:$PATH"'
+CARGO_ENV_LINE='source "$HOME/.cargo/env"'
+
+# Add to .bashrc if not already present
+if ! grep -q "\.cargo/bin" ~/.bashrc 2>/dev/null; then
+    echo "Adding uv to .bashrc..."
+    echo "# Added by arcagi setup script" >> ~/.bashrc
+    echo "$UV_PATH_LINE" >> ~/.bashrc
+    echo "$CARGO_ENV_LINE" >> ~/.bashrc
+else
+    echo "uv PATH already configured in .bashrc"
+fi
+
+# Also add to .bash_profile if it exists or create it
+if [ ! -f ~/.bash_profile ]; then
+    echo "Creating .bash_profile..."
+    cat > ~/.bash_profile << 'EOF'
+# .bash_profile
+
+# Get the aliases and functions
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+
+# User specific environment and startup programs
+EOF
+fi
+
+if ! grep -q "\.cargo/bin" ~/.bash_profile 2>/dev/null; then
+    echo "Adding uv to .bash_profile..."
+    echo "# Added by arcagi setup script" >> ~/.bash_profile
+    echo "$UV_PATH_LINE" >> ~/.bash_profile
+    echo "$CARGO_ENV_LINE" >> ~/.bash_profile
+else
+    echo "uv PATH already configured in .bash_profile"
+fi
+
 echo ""
 echo "Current environment:"
 echo "- Project directory: $PROJECT_DIR"
+# Ensure we show the virtual environment's python version
+source .venv/bin/activate
 echo "- Python version: $(python --version)"
 echo "- uv version: $(uv --version)"
 echo ""
+echo "Environment setup:"
+echo "- uv is now available in new shell sessions"
+echo "- Virtual environment: .venv (activate with: source .venv/bin/activate)"
+echo ""
 echo "To start training immediately:"
-echo "cd ~/arcagi && source .venv/bin/activate && python arcagi/color_mapping/ex33.py"
+echo "cd ~/arcagi/arcagi && source .venv/bin/activate && python arcagi/color_mapping/ex33.py"
