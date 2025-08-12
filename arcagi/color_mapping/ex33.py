@@ -106,12 +106,12 @@ class TrainingConfig(BaseModel):
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
-    death_prob: float = 0.50
-    gaussian_std: float = 0.50
-    spatial_corruption_prob: float = 0.50
+    death_prob: float = 0.01
+    gaussian_std: float = 0.01
+    spatial_corruption_prob: float = 0.01
 
     # Model parameters
-    dropout: float = 0.4
+    dropout: float = 0.05
     temperature: float = 1.0
     filename: str = "3345333e"
 
@@ -123,7 +123,7 @@ class TrainingConfig(BaseModel):
     single_file_mode: bool = True
 
     # Noise parameters
-    noise_prob: float = 0.30
+    noise_prob: float = 0.10
     
     # D4 augmentation parameters
     use_d4_augmentation: bool = False
@@ -709,6 +709,8 @@ class MainModel(pl.LightningModule):
             # x_nca = self.linear_1(h)
             # if apply_noise:
             #     x_nca = self.drop(x_nca)
+            # if apply_noise:
+            #     h = self.drop(h)
             h = h + 0.1 * self.nca(h, apply_noise=apply_noise)
             m = self.linear_1(self.message_passing(h))
             if apply_noise:
@@ -717,8 +719,6 @@ class MainModel(pl.LightningModule):
             h = h + 0.1 * m
             # if t % 2 == 0:  # More frequent normalization
             #     h = self.rms_norm(h)
-            if apply_noise:
-                h = self.drop(h)
             self.frame_capture.capture(self.linear_0(h), round_idx=t)  # Single line injection
             # signal = self.order2_projection(h)
         #     h_update = self.linear_2(x_nca)
