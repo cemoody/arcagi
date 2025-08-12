@@ -82,6 +82,7 @@ sys.path.append(
 )
 
 from lib.order2 import Order2Features
+from arcagi.adaptive_grad_scaler import AdaptiveGradScalerSkip
 
 class TrainingConfig(BaseModel):
     """Configuration for training the order2-based neural cellular automata model."""
@@ -96,7 +97,7 @@ class TrainingConfig(BaseModel):
     hidden_dim: int = 64
     num_message_rounds: int = 48
     num_final_steps: int = 12
-    num_rounds_stop_prob: float = 0.50
+    num_rounds_stop_prob: float = 0.10
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
@@ -112,6 +113,13 @@ class TrainingConfig(BaseModel):
     # D4 augmentation parameters
     use_d4_augmentation: bool = False
     d4_deterministic: bool = True  # If True, cycles through all 8 transformations
+    
+    # Adaptive gradient scaler parameters
+    enable_adaptive_grad_scaler: bool = True
+    grad_scaler_beta: float = 0.98
+    grad_scaler_warmup_steps: int = 500
+    grad_scaler_mult: float = 4.0
+    grad_scaler_z_thresh: float = 4.0
 
 
 class RMSNorm(nn.Module):
@@ -145,6 +153,7 @@ class ArsinhNorm(nn.Module):
         x_scaled = x / self.scale
         x_normed = torch.asinh(x_scaled)
         return self.weight * x_normed + self.bias
+
 
 
 class SpatialMessagePassing(nn.Module):
@@ -434,6 +443,11 @@ class MainModel(pl.LightningModule):
         num_final_steps: int = 12,
         num_rounds_stop_prob: float = 0.50,
         dim_feat: int = 45,
+        enable_adaptive_grad_scaler: bool = True,
+        grad_scaler_beta: float = 0.98,
+        grad_scaler_warmup_steps: int = 500,
+        grad_scaler_mult: float = 4.0,
+        grad_scaler_z_thresh: float = 4.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -472,6 +486,17 @@ class MainModel(pl.LightningModule):
         self.available_colors: list[int] | None = None
         self.arsinh_norm2a = ArsinhNorm(hidden_dim)
         self.arsinh_norm2b = ArsinhNorm(hidden_dim)
+        
+        # Initialize adaptive gradient scaler
+        self.enable_adaptive_grad_scaler = enable_adaptive_grad_scaler
+        if self.enable_adaptive_grad_scaler:
+            self.adaptive_grad_scaler = AdaptiveGradScalerSkip(
+                beta=grad_scaler_beta,
+                warmup_steps=grad_scaler_warmup_steps,
+                mult=grad_scaler_mult,
+                z_thresh=grad_scaler_z_thresh,
+                eps=1e-12
+            )
 
     @jaxtyped(typechecker=beartype)
     def forward(self, colors: ColorGrid, step_type: Literal["train", "val"] = "train") -> OneHot11:
@@ -488,7 +513,7 @@ class MainModel(pl.LightningModule):
             apply_noise = t < max(
                 0, self.num_message_rounds - self.num_final_steps
             )
-            if (t > self.num_message_rounds - self.num_final_steps) and (random.random() < self.num_rounds_stop_prob):
+            if self.training and (t > self.num_message_rounds - self.num_final_steps) and (random.random() < self.num_rounds_stop_prob):
                 break
             if apply_noise:
                 h = self.drop1(h)
@@ -589,7 +614,18 @@ class MainModel(pl.LightningModule):
         gradient_clip_val: float | None = None,
         gradient_clip_algorithm: str | None = None,
     ) -> None:
-        # Log and clip by global norm for stability
+        # First apply adaptive gradient scaling for spike detection if enabled
+        if self.enable_adaptive_grad_scaler:
+            scale, spiked = self.adaptive_grad_scaler.maybe_rescale_(self.parameters())
+            
+            # Log spike events and scale
+            if spiked:
+                self.log("grad_spike_detected", 1.0, on_step=True, prog_bar=False)
+                self.log("grad_spike_scale", scale, on_step=True, prog_bar=False)
+            else:
+                self.log("grad_spike_detected", 0.0, on_step=True, prog_bar=False)
+        
+        # Then apply standard gradient clipping
         if gradient_clip_val is None or gradient_clip_val <= 0:
             return
         parameters = [p for p in self.parameters() if p.grad is not None]
@@ -791,13 +827,16 @@ def main(training_config: TrainingConfig):
     # Target filename
     filename = training_config.filename
 
-    print("\n=== Order2-based Model (ex33 with D4 Augmentation) ===")
+    print("\n=== Order2-based Model (ex35 with D4 Augmentation and Adaptive Grad Scaler) ===")
     print(f"Training on 'train' subset of {filename}")
     print(f"Evaluating on 'test' subset of {filename}")
     print("Architecture: color -> order2 -> NCA -> order2 -> color")
     print(f"D4 Augmentation: {'Enabled' if training_config.use_d4_augmentation else 'Disabled'}")
     if training_config.use_d4_augmentation:
         print(f"  Mode: {'Deterministic (8x data)' if training_config.d4_deterministic else 'Random'}")
+    print(f"Adaptive Gradient Scaler: {'Enabled' if training_config.enable_adaptive_grad_scaler else 'Disabled'}")
+    if training_config.enable_adaptive_grad_scaler:
+        print(f"  Beta: {training_config.grad_scaler_beta}, Warmup: {training_config.grad_scaler_warmup_steps}, Mult: {training_config.grad_scaler_mult}, Z-thresh: {training_config.grad_scaler_z_thresh}")
     
     rich.print(training_config)
 
@@ -914,6 +953,11 @@ def main(training_config: TrainingConfig):
         spatial_corruption_prob=training_config.spatial_corruption_prob,
         num_final_steps=training_config.num_final_steps,
         num_rounds_stop_prob=training_config.num_rounds_stop_prob,
+        enable_adaptive_grad_scaler=training_config.enable_adaptive_grad_scaler,
+        grad_scaler_beta=training_config.grad_scaler_beta,
+        grad_scaler_warmup_steps=training_config.grad_scaler_warmup_steps,
+        grad_scaler_mult=training_config.grad_scaler_mult,
+        grad_scaler_z_thresh=training_config.grad_scaler_z_thresh,
     )
 
     # Compute available colors from training data and set constraints
