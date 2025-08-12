@@ -278,15 +278,22 @@ fi
 echo "12. Setting up uv in bash profile..."
 UV_PATH_LINE='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
 CARGO_ENV_LINE='[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"'
+EDITOR_LINE='export EDITOR=vim'
 
 # Add to .bashrc if not already present
 if ! grep -q "\.local/bin\|\.cargo/bin" ~/.bashrc 2>/dev/null; then
-    echo "Adding uv to .bashrc..."
+    echo "Adding uv and editor config to .bashrc..."
     echo "# Added by arcagi setup script" >> ~/.bashrc
     echo "$UV_PATH_LINE" >> ~/.bashrc
     echo "$CARGO_ENV_LINE" >> ~/.bashrc
+    echo "$EDITOR_LINE" >> ~/.bashrc
 else
     echo "uv PATH already configured in .bashrc"
+    # Check if EDITOR is set, if not add it
+    if ! grep -q "EDITOR=vim" ~/.bashrc 2>/dev/null; then
+        echo "Adding EDITOR=vim to .bashrc..."
+        echo "$EDITOR_LINE" >> ~/.bashrc
+    fi
 fi
 
 # Also add to .bash_profile if it exists or create it
@@ -305,12 +312,19 @@ EOF
 fi
 
 if ! grep -q "\.local/bin\|\.cargo/bin" ~/.bash_profile 2>/dev/null; then
-    echo "Adding uv to .bash_profile..."
+    echo "Adding uv and editor config to .bash_profile..."
     echo "# Added by arcagi setup script" >> ~/.bash_profile
     echo "$UV_PATH_LINE" >> ~/.bash_profile
     echo "$CARGO_ENV_LINE" >> ~/.bash_profile
+    echo "$EDITOR_LINE" >> ~/.bash_profile
+
 else
     echo "uv PATH already configured in .bash_profile"
+    # Check if EDITOR is set, if not add it
+    if ! grep -q "EDITOR=vim" ~/.bash_profile 2>/dev/null; then
+        echo "Adding EDITOR=vim to .bash_profile..."
+        echo "$EDITOR_LINE" >> ~/.bash_profile
+    fi
 fi
 
 echo ""

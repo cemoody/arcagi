@@ -3,7 +3,7 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, RandomSampler
 
 
 def load_npz_data(
@@ -413,6 +413,7 @@ def create_dataloader(
     inputs_features: Optional[torch.Tensor] = None,
     outputs_features: Optional[torch.Tensor] = None,
     indices: Optional[torch.Tensor] = None,
+    repeat_factor: int = 1,
 ) -> DataLoader[Any]:
     """Create a DataLoader from input and output tensors.
 
@@ -425,6 +426,9 @@ def create_dataloader(
         inputs_features: Optional invariant input features
         outputs_features: Optional invariant output features
         indices: Optional indices tensor
+        repeat_factor: If > 1, repeats sampling within an epoch to see the same example
+            multiple times. Implemented via a sampler with replacement. Effective number
+            of samples per epoch becomes len(dataset) * repeat_factor.
 
     Returns:
         DataLoader instance
@@ -447,12 +451,19 @@ def create_dataloader(
 
     dataset = TensorDataset(inputs, outputs, inputs_features, outputs_features, indices)
 
+    sampler = None
+    if repeat_factor is not None and repeat_factor > 1:
+        # Sample with replacement to achieve repeated views per epoch
+        total_samples = len(dataset) * repeat_factor
+        sampler = RandomSampler(dataset, replacement=True, num_samples=total_samples)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle if sampler is None else False),
         num_workers=num_workers,
         pin_memory=True,
+        sampler=sampler,
     )
 
 

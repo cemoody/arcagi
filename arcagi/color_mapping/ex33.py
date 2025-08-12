@@ -617,7 +617,7 @@ class MainModel(pl.LightningModule):
     training_index_metrics: Dict[int, Dict[str, int]] = {}
     validation_index_metrics: Dict[int, Dict[str, int]] = {}
     force_visualize: bool = False
-    last_loss: float | None = None
+    last_max_loss: float | None = None
     last_logits_abs_mean: float | None = None
 
     def __init__(
@@ -738,7 +738,8 @@ class MainModel(pl.LightningModule):
         
         # Logits explosion detection
         current_logits_abs_mean = float(combined_logits.abs().mean().item())
-        print(f"Current logits abs mean: {current_logits_abs_mean:.6f}")
+        self.log(f"logits_abs_mean", current_logits_abs_mean)  # type: ignore
+        # print(f"Current logits abs mean: {current_logits_abs_mean:.6f}")
         if self.last_logits_abs_mean is not None and current_logits_abs_mean > 2 * self.last_logits_abs_mean:
             print(f"\n!!! LOGITS EXPLOSION DETECTED IN FORWARD !!!")
             print(f"Previous logits abs mean: {self.last_logits_abs_mean:.6f}")
@@ -779,15 +780,16 @@ class MainModel(pl.LightningModule):
         
         # Loss explosion detection
         current_loss = float(loss.item())
-        if self.last_loss is not None and current_loss > 10 * self.last_loss:
+        if self.last_max_loss is not None and current_loss > self.last_max_loss:
+            breakpoint()
             print(f"\n!!! LOSS EXPLOSION DETECTED !!!")
-            print(f"Previous loss: {self.last_loss:.6f}")
+            print(f"Previous loss: {self.last_max_loss:.6f}")
             print(f"Current loss: {current_loss:.6f}")
-            print(f"Ratio: {current_loss / self.last_loss:.2f}x")
+            print(f"Ratio: {current_loss / self.last_max_loss:.2f}x")
             print(f"Epoch: {self.current_epoch}, Batch: {batch_idx}")
             print(f"Logits stats: min={logits.min().item():.6f}, max={logits.max().item():.6f}, mean={logits.mean().item():.6f}")
         
-        self.last_loss = current_loss
+            self.last_max_loss = current_loss
         
         image_metrics(i.out, logits, metrics, prefix=step_type)
 
@@ -1107,6 +1109,7 @@ def main(training_config: TrainingConfig):
             inputs_features=train_input_features,
             outputs_features=train_output_features,
             indices=train_indices,
+            repeat_factor=10,
         )
     
     # Validation and test loaders don't use augmentation
