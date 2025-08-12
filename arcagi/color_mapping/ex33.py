@@ -95,7 +95,7 @@ class TrainingConfig(BaseModel):
     # Training parameters
     max_epochs: int = 2000
     lr: float = 0.005
-    weight_decay: float = 1e-8
+    weight_decay: float = 1e-9
     hidden_dim: int = 64
     num_message_rounds: int = 32
 
@@ -106,7 +106,7 @@ class TrainingConfig(BaseModel):
     spatial_corruption_prob: float = 0.15
 
     # Model parameters
-    dropout: float = 0.1
+    dropout: float = 0.2
     temperature: float = 1.0
     filename: str = "3345333e"
 
