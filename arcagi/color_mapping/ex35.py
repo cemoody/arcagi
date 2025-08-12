@@ -96,14 +96,15 @@ class TrainingConfig(BaseModel):
     hidden_dim: int = 64
     num_message_rounds: int = 48
     num_final_steps: int = 12
+    num_rounds_stop_prob: float = 0.50
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
     death_prob: float = 0.20
     gaussian_std: float = 0.20
     spatial_corruption_prob: float = 0.20
-    dropout: float = 0.20
-    dropout_h: float = 0.10
+    dropout: float = 0.05
+    dropout_h: float = 0.05
 
     # Model parameters
     filename: str = "3345333e"
@@ -431,6 +432,7 @@ class MainModel(pl.LightningModule):
         gaussian_std: float = 0.05,
         spatial_corruption_prob: float = 0.01,
         num_final_steps: int = 12,
+        num_rounds_stop_prob: float = 0.50,
         dim_feat: int = 45,
     ):
         super().__init__()
@@ -438,11 +440,13 @@ class MainModel(pl.LightningModule):
 
         self.hidden_dim = hidden_dim
         self.num_message_rounds = num_message_rounds
+        self.num_rounds_stop_prob = num_rounds_stop_prob
         self.dropout = dropout
         self.lr = lr
         self.weight_decay = weight_decay
         # Order2 feature extractor
         self.order2_encoder = Order2Features()
+        self.num_final_steps = num_final_steps
 
         # Feature processing and projection to NCA space
         self.feature_processor = nn.Sequential(
@@ -468,11 +472,6 @@ class MainModel(pl.LightningModule):
         self.available_colors: list[int] | None = None
         self.arsinh_norm2a = ArsinhNorm(hidden_dim)
         self.arsinh_norm2b = ArsinhNorm(hidden_dim)
-        self.self_healing_noise = SelfHealingNoise(
-                death_prob=death_prob,
-                gaussian_std=gaussian_std,
-                spatial_corruption_prob=spatial_corruption_prob,
-            )
 
     @jaxtyped(typechecker=beartype)
     def forward(self, colors: ColorGrid, step_type: Literal["train", "val"] = "train") -> OneHot11:
@@ -487,16 +486,17 @@ class MainModel(pl.LightningModule):
         self.frame_capture.capture(self.linear_0(h), round_idx=-1)  # Capture initial state
         for t in range(self.num_message_rounds):
             apply_noise = t < max(
-                0, self.num_message_rounds - self.nca.num_final_steps
+                0, self.num_message_rounds - self.num_final_steps
             )
-            if self.training and apply_noise:
+            if (t > self.num_message_rounds - self.num_final_steps) and (random.random() < self.num_rounds_stop_prob):
+                break
+            if apply_noise:
                 h = self.drop1(h)
-                h = self.self_healing_noise(h)
             u = self.nca(h, apply_noise=apply_noise)
             u = self.arsinh_norm2a(u)
             h = h + 0.1 * u
             m = self.linear_1(self.message_passing(h))
-            if self.training and apply_noise:
+            if apply_noise:
                 m = self.drop(m)
             m = self.arsinh_norm2b(m)
             h = h + 0.1 * m
@@ -913,6 +913,7 @@ def main(training_config: TrainingConfig):
         gaussian_std=training_config.gaussian_std,
         spatial_corruption_prob=training_config.spatial_corruption_prob,
         num_final_steps=training_config.num_final_steps,
+        num_rounds_stop_prob=training_config.num_rounds_stop_prob,
     )
 
     # Compute available colors from training data and set constraints
