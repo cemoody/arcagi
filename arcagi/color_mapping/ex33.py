@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from pydanclick import from_pydantic
 from pydantic import BaseModel
 from pytorch_lightning.callbacks import ModelCheckpoint
+import rich
 
 FuncT = TypeVar("FuncT")
 
@@ -83,6 +84,46 @@ sys.path.append(
 )
 
 from lib.order2 import Order2Features
+
+class TrainingConfig(BaseModel):
+    """Configuration for training the order2-based neural cellular automata model."""
+
+    # Data and checkpoint paths
+    data_dir: str = "/tmp/arc_data"
+    checkpoint_dir: str = "order2_checkpoints"
+
+    # Training parameters
+    max_epochs: int = 2000
+    lr: float = 0.005
+    weight_decay: float = 1e-8
+    hidden_dim: int = 64
+    num_message_rounds: int = 32
+
+    # Self-healing noise parameters
+    enable_self_healing: bool = True
+    death_prob: float = 0.15
+    gaussian_std: float = 0.15
+    spatial_corruption_prob: float = 0.15
+
+    # Model parameters
+    dropout: float = 0.1
+    temperature: float = 1.0
+    filename: str = "3345333e"
+
+    # Early stopping parameters
+    patience: int = 100
+    min_epochs: int = 500
+
+    # Training mode
+    single_file_mode: bool = True
+
+    # Noise parameters
+    noise_prob: float = 0.10
+    num_final_steps: int = 6
+    
+    # D4 augmentation parameters
+    use_d4_augmentation: bool = False
+    d4_deterministic: bool = True  # If True, cycles through all 8 transformations
 
 
 @jaxtyped(typechecker=beartype)
@@ -242,13 +283,11 @@ class SelfHealingNoise(nn.Module):
         self: "SelfHealingNoise",
         death_prob: float = 0.05,
         gaussian_std: float = 0.1,
-        salt_pepper_prob: float = 0.02,
         spatial_corruption_prob: float = 0.03,
     ) -> None:
         super().__init__()
         self.death_prob = death_prob
         self.gaussian_std = gaussian_std
-        self.salt_pepper_prob = salt_pepper_prob
         self.spatial_corruption_prob = spatial_corruption_prob
 
     @jaxtyped(typechecker=beartype)
@@ -262,11 +301,6 @@ class SelfHealingNoise(nn.Module):
         if self.gaussian_std > 0:
             noise = torch.randn_like(h) * self.gaussian_std
             h = h + noise
-        if self.salt_pepper_prob > 0:
-            salt_pepper_mask = torch.rand_like(h) < self.salt_pepper_prob
-            salt_mask = torch.rand_like(h) > 0.5
-            extreme_values = torch.where(salt_mask, 1.0, -1.0)
-            h = torch.where(salt_pepper_mask, extreme_values, h)
         if self.spatial_corruption_prob > 0:
             for bi in range(b):
                 if random.random() < self.spatial_corruption_prob:
@@ -285,7 +319,6 @@ class NeuralCellularAutomata2(nn.Module):
         enable_self_healing: bool = True,
         death_prob: float = 0.05,
         gaussian_std: float = 0.05,
-        salt_pepper_prob: float = 0.05,
         spatial_corruption_prob: float = 0.05,
         num_final_steps: int = 12,
     ) -> None:
@@ -305,7 +338,6 @@ class NeuralCellularAutomata2(nn.Module):
             SelfHealingNoise(
                 death_prob=death_prob,
                 gaussian_std=gaussian_std,
-                salt_pepper_prob=salt_pepper_prob,
                 spatial_corruption_prob=spatial_corruption_prob,
             )
             if enable_self_healing
@@ -499,47 +531,6 @@ class NeuralCellularAutomata2(nn.Module):
         return h_new
 
 
-class TrainingConfig(BaseModel):
-    """Configuration for training the order2-based neural cellular automata model."""
-
-    # Data and checkpoint paths
-    data_dir: str = "/tmp/arc_data"
-    checkpoint_dir: str = "order2_checkpoints"
-
-    # Training parameters
-    max_epochs: int = 2000
-    lr: float = 0.005
-    weight_decay: float = 1e-8
-    hidden_dim: int = 64
-    num_message_rounds: int = 32
-
-    # Self-healing noise parameters
-    enable_self_healing: bool = True
-    death_prob: float = 0.05
-    gaussian_std: float = 0.05
-    salt_pepper_prob: float = 0.05
-    spatial_corruption_prob: float = 0.05
-
-    # Model parameters
-    dropout: float = 0.1
-    temperature: float = 1.0
-    filename: str = "3345333e"
-
-    # Early stopping parameters
-    patience: int = 100
-    min_epochs: int = 500
-
-    # Training mode
-    single_file_mode: bool = True
-
-    # Noise parameters
-    noise_prob: float = 0.10
-    num_final_steps: int = 6
-    
-    # D4 augmentation parameters
-    use_d4_augmentation: bool = False
-    d4_deterministic: bool = True  # If True, cycles through all 8 transformations
-
 
 @jaxtyped(typechecker=beartype)
 def batch_to_dataclass(
@@ -634,7 +625,6 @@ class MainModel(pl.LightningModule):
         enable_self_healing: bool = True,
         death_prob: float = 0.02,
         gaussian_std: float = 0.05,
-        salt_pepper_prob: float = 0.01,
         spatial_corruption_prob: float = 0.01,
         num_final_steps: int = 12,
         dim_nca: int = 64,
@@ -675,7 +665,6 @@ class MainModel(pl.LightningModule):
             enable_self_healing=enable_self_healing,
             death_prob=death_prob,
             gaussian_std=gaussian_std,
-            salt_pepper_prob=salt_pepper_prob,
             spatial_corruption_prob=spatial_corruption_prob,
             num_final_steps=num_final_steps,
         )
@@ -1037,6 +1026,8 @@ def main(training_config: TrainingConfig):
     print(f"D4 Augmentation: {'Enabled' if training_config.use_d4_augmentation else 'Disabled'}")
     if training_config.use_d4_augmentation:
         print(f"  Mode: {'Deterministic (8x data)' if training_config.d4_deterministic else 'Random'}")
+    
+    rich.print(training_config)
 
     # Load train subset using data_loader.py
     (
@@ -1148,7 +1139,6 @@ def main(training_config: TrainingConfig):
         enable_self_healing=training_config.enable_self_healing,
         death_prob=training_config.death_prob,
         gaussian_std=training_config.gaussian_std,
-        salt_pepper_prob=training_config.salt_pepper_prob,
         spatial_corruption_prob=training_config.spatial_corruption_prob,
         num_final_steps=training_config.num_final_steps,
     )
