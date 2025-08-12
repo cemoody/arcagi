@@ -143,6 +143,24 @@ class RMSNorm(nn.Module):
         return self.weight * x_normed
 
 
+class ArsinhNorm(nn.Module):
+    """Inverse Hyperbolic Sine Normalization - more stable than RMSNorm."""
+
+    def __init__(self: "ArsinhNorm", dim: int, scale: float = 1.0) -> None:
+        super().__init__()
+        self.scale = scale
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: HiddenGrid) -> HiddenGrid:
+        # Apply asinh normalization: asinh(x/scale)
+        # asinh is smooth, handles pos/neg values, and has bounded gradients
+        x_scaled = x / self.scale
+        x_normed = torch.asinh(x_scaled)
+        return self.weight * x_normed + self.bias
+
+
 class Order2ToColorDecoder(nn.Module):
     """
     Decoder network that converts order2 features back to color predictions.
@@ -189,12 +207,19 @@ class SpatialMessagePassing(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        
+        # Ensure groups divides hidden_dim evenly
+        groups = hidden_dim // 16 if hidden_dim >= 16 else 1
+        # Find the largest divisor of hidden_dim that's <= groups
+        while groups > 1 and hidden_dim % groups != 0:
+            groups -= 1
+        
         self.conv = nn.Conv2d(
             hidden_dim,
             hidden_dim,
             kernel_size=3,
             padding=1,
-            groups=max(1, hidden_dim // 16),
+            groups=groups,
         )
         self.norm = RMSNorm(hidden_dim)
         self.activation = nn.GELU()
@@ -659,6 +684,8 @@ class MainModel(pl.LightningModule):
         )
         self.drop = nn.Dropout(dropout)
         self.available_colors: list[int] | None = None
+        self.arsinh_norm1 = ArsinhNorm(hidden_dim)
+        self.arsinh_norm2 = ArsinhNorm(hidden_dim)
 
     @jaxtyped(typechecker=beartype)
     def forward(self, colors: ColorGrid) -> OneHot11:
@@ -685,13 +712,15 @@ class MainModel(pl.LightningModule):
             # x_nca = self.linear_1(h)
             # if apply_noise:
             #     x_nca = self.drop(x_nca)
-            h = h + self.nca(h, apply_noise=apply_noise)
+            h = h + 0.1 * self.nca(h, apply_noise=apply_noise)
             m = self.linear_1(self.message_passing(h))
             if apply_noise:
                 m = self.drop(m)
-            h = h + m
-            if t % 4 == 0:
-                h = self.rms_norm(h)
+            m = self.arsinh_norm2(m)
+            h = h + 0.1 * m
+            # if t % 2 == 0:  # More frequent normalization
+            #     h = self.rms_norm(h)
+            h = self.arsinh_norm1(h)
             # signal = self.order2_projection(h)
         #     h_update = self.linear_2(x_nca)
         #     if apply_noise:
@@ -718,7 +747,6 @@ class MainModel(pl.LightningModule):
             print(f"Epoch: {self.current_epoch}")
             print(f"Logits stats: min={combined_logits.min().item():.6f}, max={combined_logits.max().item():.6f}")
             print(f"Hidden h stats: min={h.min().item():.6f}, max={h.max().item():.6f}, mean={h.mean().item():.6f}")
-            import pdb; pdb.set_trace()  # Breakpoint for logits explosion
         
         self.last_logits_abs_mean = current_logits_abs_mean
         
@@ -758,7 +786,6 @@ class MainModel(pl.LightningModule):
             print(f"Ratio: {current_loss / self.last_loss:.2f}x")
             print(f"Epoch: {self.current_epoch}, Batch: {batch_idx}")
             print(f"Logits stats: min={logits.min().item():.6f}, max={logits.max().item():.6f}, mean={logits.mean().item():.6f}")
-            import pdb; pdb.set_trace()  # Breakpoint for loss explosion
         
         self.last_loss = current_loss
         
