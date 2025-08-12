@@ -138,7 +138,7 @@ class RMSNorm(nn.Module):
 
     @jaxtyped(typechecker=beartype)
     def forward(self, x: HiddenGrid) -> HiddenGrid:
-        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True)) + self.eps
         x_normed = x / rms
         return self.weight * x_normed
 
@@ -592,6 +592,8 @@ class MainModel(pl.LightningModule):
     training_index_metrics: Dict[int, Dict[str, int]] = {}
     validation_index_metrics: Dict[int, Dict[str, int]] = {}
     force_visualize: bool = False
+    last_loss: float | None = None
+    last_logits_abs_mean: float | None = None
 
     def __init__(
         self,
@@ -704,6 +706,22 @@ class MainModel(pl.LightningModule):
         #     color_logits = apply_color_constraints(color_logits, self.available_colors)
         # combined_logits = torch.cat([mask_logits, color_logits], dim=-1)
         combined_logits = self.linear_0(h)
+        
+        # Logits explosion detection
+        current_logits_abs_mean = float(combined_logits.abs().mean().item())
+        print(f"Current logits abs mean: {current_logits_abs_mean:.6f}")
+        if self.last_logits_abs_mean is not None and current_logits_abs_mean > 2 * self.last_logits_abs_mean:
+            print(f"\n!!! LOGITS EXPLOSION DETECTED IN FORWARD !!!")
+            print(f"Previous logits abs mean: {self.last_logits_abs_mean:.6f}")
+            print(f"Current logits abs mean: {current_logits_abs_mean:.6f}")
+            print(f"Ratio: {current_logits_abs_mean / self.last_logits_abs_mean:.2f}x")
+            print(f"Epoch: {self.current_epoch}")
+            print(f"Logits stats: min={combined_logits.min().item():.6f}, max={combined_logits.max().item():.6f}")
+            print(f"Hidden h stats: min={h.min().item():.6f}, max={h.max().item():.6f}, mean={h.mean().item():.6f}")
+            import pdb; pdb.set_trace()  # Breakpoint for logits explosion
+        
+        self.last_logits_abs_mean = current_logits_abs_mean
+        
         return combined_logits
 
     @jaxtyped(typechecker=beartype)
@@ -730,6 +748,20 @@ class MainModel(pl.LightningModule):
         logits = self(i.inp.col)
         logits_perm = logits.permute(0, 3, 1, 2)  # [B, 11, 30, 30]
         loss = cross_entropy_shifted(logits_perm, i.out.col.long(), start_index=-1)
+        
+        # Loss explosion detection
+        current_loss = float(loss.item())
+        if self.last_loss is not None and current_loss > 10 * self.last_loss:
+            print(f"\n!!! LOSS EXPLOSION DETECTED !!!")
+            print(f"Previous loss: {self.last_loss:.6f}")
+            print(f"Current loss: {current_loss:.6f}")
+            print(f"Ratio: {current_loss / self.last_loss:.2f}x")
+            print(f"Epoch: {self.current_epoch}, Batch: {batch_idx}")
+            print(f"Logits stats: min={logits.min().item():.6f}, max={logits.max().item():.6f}, mean={logits.mean().item():.6f}")
+            import pdb; pdb.set_trace()  # Breakpoint for loss explosion
+        
+        self.last_loss = current_loss
+        
         image_metrics(i.out, logits, metrics, prefix=step_type)
 
         # Visualize every 10 epochs
