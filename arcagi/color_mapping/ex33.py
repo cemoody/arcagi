@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import os
 import random
@@ -25,6 +27,7 @@ import torch.nn.functional as F
 from pydanclick import from_pydantic
 from pydantic import BaseModel
 from pytorch_lightning.callbacks import ModelCheckpoint
+from loguru import logger
 import rich
 
 FuncT = TypeVar("FuncT")
@@ -77,6 +80,7 @@ from d4_augmentation_dataset import create_d4_augmented_dataloader
 from models import Batch, BatchData
 from utils.metrics import image_metrics
 from utils.terminal_imshow import imshow
+from utils.frame_capture import FrameCapture
 
 # Import Order2Features from lib
 sys.path.append(
@@ -97,16 +101,17 @@ class TrainingConfig(BaseModel):
     lr: float = 0.005
     weight_decay: float = 1e-9
     hidden_dim: int = 64
-    num_message_rounds: int = 32
+    num_message_rounds: int = 48
+    num_final_steps: int = 12
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
-    death_prob: float = 0.15
-    gaussian_std: float = 0.15
-    spatial_corruption_prob: float = 0.15
+    death_prob: float = 0.50
+    gaussian_std: float = 0.50
+    spatial_corruption_prob: float = 0.50
 
     # Model parameters
-    dropout: float = 0.2
+    dropout: float = 0.4
     temperature: float = 1.0
     filename: str = "3345333e"
 
@@ -118,8 +123,7 @@ class TrainingConfig(BaseModel):
     single_file_mode: bool = True
 
     # Noise parameters
-    noise_prob: float = 0.10
-    num_final_steps: int = 6
+    noise_prob: float = 0.30
     
     # D4 augmentation parameters
     use_d4_augmentation: bool = False
@@ -612,6 +616,7 @@ class MainModel(pl.LightningModule):
     force_visualize: bool = False
     last_max_loss: float | None = None
     last_logits_abs_mean: float | None = None
+    frame_capture: FrameCapture = FrameCapture()
 
     def __init__(
         self,
@@ -696,6 +701,7 @@ class MainModel(pl.LightningModule):
         # combined_logits = self.linear_0(h)
         # assert combined_logits.shape == (colors.shape[0], 30, 30, 11)
         # noisy_steps = self.num_message_rounds - self.nca.num_final_steps
+        self.frame_capture.capture(self.linear_0(h), round_idx=-1)  # Capture initial state
         for t in range(self.num_message_rounds):
             apply_noise = t < max(
                 0, self.num_message_rounds - self.nca.num_final_steps
@@ -711,7 +717,9 @@ class MainModel(pl.LightningModule):
             h = h + 0.1 * m
             # if t % 2 == 0:  # More frequent normalization
             #     h = self.rms_norm(h)
-            h = self.arsinh_norm1(h)
+            if apply_noise:
+                h = self.drop(h)
+            self.frame_capture.capture(self.linear_0(h), round_idx=t)  # Single line injection
             # signal = self.order2_projection(h)
         #     h_update = self.linear_2(x_nca)
         #     if apply_noise:
@@ -742,6 +750,7 @@ class MainModel(pl.LightningModule):
         
         self.last_logits_abs_mean = current_logits_abs_mean
         
+        self.frame_capture.capture(combined_logits, round_idx=self.num_message_rounds)  # Capture final state
         return combined_logits
 
     @jaxtyped(typechecker=beartype)
@@ -752,7 +761,13 @@ class MainModel(pl.LightningModule):
     def validation_step(
         self, batch: List[torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        return self.step(batch, batch_idx, step_type="val")
+        self.frame_capture.clear()
+        self.frame_capture.enable()
+        out = self.step(batch, batch_idx, step_type="val")
+        self.frame_capture.disable()
+        self.frame_capture.to_gif(f"gifs/message_rounds_{self.current_epoch}.gif", duration_ms=100)
+        logger.info(f"Animation saved to message_rounds_{self.current_epoch}.gif")
+        return out
 
     @jaxtyped(typechecker=beartype)
     def step(
@@ -964,6 +979,22 @@ class MainModel(pl.LightningModule):
         }
 
     @jaxtyped(typechecker=beartype)
+    def save_round_animation(self, filename: str = "message_rounds.gif", duration_ms: int = 100):
+        """Save captured frames from message rounds as an animated GIF."""
+        if len(self.frame_capture) > 0:
+            # Transform logits to predictions
+            def transform_logits(logits):
+                # logits shape: [B, 30, 30, 11]
+                # Take argmax and subtract 1 to map back to color indices
+                preds = logits.argmax(dim=-1) - 1  # Now -1 is mask, 0-9 are colors
+                return preds
+            
+            self.frame_capture.set_transform(transform_logits)
+            self.frame_capture.to_gif(filename, duration_ms=duration_ms)
+            print(f"Animation saved to {filename} with {len(self.frame_capture)} frames")
+        else:
+            print("No frames captured. Enable frame capture before running forward pass.")
+    
     def visualize_predictions(
         self,
         i: BatchData,
@@ -1167,17 +1198,27 @@ def main(training_config: TrainingConfig):
     # Optional Weights & Biases logging (enabled if available)
     wandb_logger = None
     if WandbLogger is not None:
-        try:
-            wandb_logger = WandbLogger(project="arcagi", name=f"ex32-{filename}")
-        except Exception:
-            wandb_logger = None
+        # Generate hash of training config for unique identification
+        config_dict = training_config.model_dump()
+        config_str = json.dumps(config_dict, sort_keys=True)
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+        
+        # Create run name with config hash
+        run_name = f"ex33-{filename}-{config_hash}"
+        
+        # Initialize wandb logger with all config parameters
+        wandb_logger = WandbLogger(
+            project="arcagi", 
+            name=run_name,
+            config=config_dict  # Pass all training config parameters as hyperparameters
+        )
 
     if wandb_logger is not None:
         trainer = pl.Trainer(
             max_epochs=training_config.max_epochs,
             callbacks=[checkpoint_callback],
             default_root_dir=training_config.checkpoint_dir,
-            gradient_clip_val=1.0,
+            gradient_clip_val=0.10,
             gradient_clip_algorithm="norm",
             logger=wandb_logger,  # type: ignore[arg-type]
             log_every_n_steps=1,
@@ -1187,7 +1228,7 @@ def main(training_config: TrainingConfig):
             max_epochs=training_config.max_epochs,
             callbacks=[checkpoint_callback],
             default_root_dir=training_config.checkpoint_dir,
-            gradient_clip_val=1.0,
+            gradient_clip_val=0.1,
             gradient_clip_algorithm="norm",
             log_every_n_steps=1,
         )
