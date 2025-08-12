@@ -535,7 +535,7 @@ class TrainingConfig(BaseModel):
     num_final_steps: int = 6
     
     # D4 augmentation parameters
-    use_d4_augmentation: bool = True
+    use_d4_augmentation: bool = False
     d4_deterministic: bool = True  # If True, cycles through all 8 transformations
 
 
