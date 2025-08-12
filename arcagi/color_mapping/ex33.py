@@ -1,5 +1,6 @@
 import math
 import os
+import random
 
 # Import from parent module
 import sys
@@ -268,10 +269,11 @@ class SelfHealingNoise(nn.Module):
             h = torch.where(salt_pepper_mask, extreme_values, h)
         if self.spatial_corruption_prob > 0:
             for bi in range(b):
-                if torch.rand(1).item() < self.spatial_corruption_prob:
-                    y = torch.randint(0, height - 2, (1,)).item()
-                    x = torch.randint(0, width - 2, (1,)).item()
-                    h[bi, y : y + 3, x : x + 3, :] = 0
+                if random.random() < self.spatial_corruption_prob:
+                    grid_size = random.randint(1, 5)  # Random size 1-5
+                    y = torch.randint(0, height - grid_size + 1, (1,)).item()
+                    x = torch.randint(0, width - grid_size + 1, (1,)).item()
+                    h[bi, y : y + grid_size, x : x + grid_size, :] = 0
         return h
 
 
@@ -281,10 +283,10 @@ class NeuralCellularAutomata2(nn.Module):
         hidden_dim: int,
         dropout: float = 0.05,
         enable_self_healing: bool = True,
-        death_prob: float = 0.02,
+        death_prob: float = 0.05,
         gaussian_std: float = 0.05,
-        salt_pepper_prob: float = 0.01,
-        spatial_corruption_prob: float = 0.01,
+        salt_pepper_prob: float = 0.05,
+        spatial_corruption_prob: float = 0.05,
         num_final_steps: int = 12,
     ) -> None:
         super().__init__()
@@ -513,10 +515,10 @@ class TrainingConfig(BaseModel):
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
-    death_prob: float = 0.02
+    death_prob: float = 0.05
     gaussian_std: float = 0.05
-    salt_pepper_prob: float = 0.01
-    spatial_corruption_prob: float = 0.01
+    salt_pepper_prob: float = 0.05
+    spatial_corruption_prob: float = 0.05
 
     # Model parameters
     dropout: float = 0.1
@@ -781,7 +783,6 @@ class MainModel(pl.LightningModule):
         # Loss explosion detection
         current_loss = float(loss.item())
         if self.last_max_loss is not None and current_loss > self.last_max_loss:
-            breakpoint()
             print(f"\n!!! LOSS EXPLOSION DETECTED !!!")
             print(f"Previous loss: {self.last_max_loss:.6f}")
             print(f"Current loss: {current_loss:.6f}")
