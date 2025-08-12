@@ -8,6 +8,7 @@ echo "=== ARC-AGI GPU Instance Setup Script ==="
 echo "This script will set up everything needed to run experiments"
 echo ""
 
+
 # Update system packages
 echo "1. Updating system packages..."
 sudo apt-get update -y
@@ -137,6 +138,10 @@ else
     # For existing repos, make sure we're in the right directory
     cd "$PROJECT_DIR"
 fi
+
+mkdir -p processed_data
+wget https://pub-0f656cd4e2e94564bb83c4f83a634600.r2.dev/train_all_d4aug.npz -O processed_data/train_all_d4aug.npz
+wget https://pub-0f656cd4e2e94564bb83c4f83a634600.r2.dev/train_all.npz -O processed_data/train_all.npz
 
 # Set up Python environment with uv
 echo "6. Setting up Python environment..."
@@ -322,3 +327,6 @@ echo "- Virtual environment: .venv (activate with: source .venv/bin/activate)"
 echo ""
 echo "To start training immediately:"
 echo "cd ~/arcagi/arcagi && source .venv/bin/activate && python arcagi/color_mapping/ex33.py"
+
+git config --global user.email "chrisemoody@gmail.com"
+git config --global user.name "Christopher Erick Moody"

@@ -71,6 +71,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import our visualization tools
 # Import data loading functions
 from data_loader import create_dataloader, prepare_dataset
+from d4_augmentation_dataset import create_d4_augmented_dataloader
 from models import Batch, BatchData
 from utils.metrics import image_metrics
 from utils.terminal_imshow import imshow
@@ -481,9 +482,9 @@ class TrainingConfig(BaseModel):
     # Training parameters
     max_epochs: int = 2000
     lr: float = 0.005
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-8
     hidden_dim: int = 64
-    num_message_rounds: int = 24
+    num_message_rounds: int = 32
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
@@ -507,6 +508,10 @@ class TrainingConfig(BaseModel):
     # Noise parameters
     noise_prob: float = 0.10
     num_final_steps: int = 6
+    
+    # D4 augmentation parameters
+    use_d4_augmentation: bool = True
+    d4_deterministic: bool = True  # If True, cycles through all 8 transformations
 
 
 @jaxtyped(typechecker=beartype)
@@ -621,6 +626,8 @@ class MainModel(pl.LightningModule):
         # Order2 feature extractor
         self.order2_encoder = Order2Features()
 
+        self.rms_norm = RMSNorm(hidden_dim)
+
         # Feature processing and projection to NCA space
         self.feature_processor = nn.Sequential(
             nn.Linear(dim_feat, hidden_dim),
@@ -630,7 +637,7 @@ class MainModel(pl.LightningModule):
         self.noise_prob = 0.05
         self.linear_0 = nn.Linear(hidden_dim, 11)
 
-        self.linear_1 = nn.Linear(hidden_dim, dim_nca)
+        self.linear_1 = nn.Linear(hidden_dim, hidden_dim)
         self.linear_2 = nn.Linear(dim_nca, hidden_dim)
 
         self.nca = NeuralCellularAutomata2(
@@ -669,15 +676,20 @@ class MainModel(pl.LightningModule):
         # combined_logits = self.linear_0(h)
         # assert combined_logits.shape == (colors.shape[0], 30, 30, 11)
         # noisy_steps = self.num_message_rounds - self.nca.num_final_steps
-        for _t in range(self.num_message_rounds):
-            apply_noise = _t < max(
+        for t in range(self.num_message_rounds):
+            apply_noise = t < max(
                 0, self.num_message_rounds - self.nca.num_final_steps
             )
             # x_nca = self.linear_1(h)
             # if apply_noise:
             #     x_nca = self.drop(x_nca)
             h = h + self.nca(h, apply_noise=apply_noise)
-            h = h + self.message_passing(h)
+            m = self.linear_1(self.message_passing(h))
+            if apply_noise:
+                m = self.drop(m)
+            h = h + m
+            if t % 4 == 0:
+                h = self.rms_norm(h)
             # signal = self.order2_projection(h)
         #     h_update = self.linear_2(x_nca)
         #     if apply_noise:
@@ -746,6 +758,27 @@ class MainModel(pl.LightningModule):
             pass
 
         return loss
+
+    def configure_gradient_clipping(
+        self,
+        optimizer: torch.optim.Optimizer,
+        gradient_clip_val: float,
+        gradient_clip_algorithm: str,
+    ) -> None:
+        # Log and clip by global norm for stability
+        if gradient_clip_val is None or gradient_clip_val <= 0:
+            return
+        parameters = [p for p in self.parameters() if p.grad is not None]
+        if not parameters:
+            return
+        total_norm = torch.norm(
+            torch.stack([torch.norm(p.grad.detach(), 2) for p in parameters]), 2
+        )
+        torch.nn.utils.clip_grad_norm_(
+            parameters, max_norm=gradient_clip_val, norm_type=2.0
+        )
+        # Lightweight logging each step
+        self.log("grad_total_norm", total_norm, on_step=True, prog_bar=False)
 
     def log_metrics(
         self, metrics: Dict[int, Dict[str, int]], prefix: str = "train"
@@ -935,10 +968,13 @@ def main(training_config: TrainingConfig):
     # Target filename
     filename = training_config.filename
 
-    print("\n=== Order2-based Model (ex30) ===")
+    print("\n=== Order2-based Model (ex33 with D4 Augmentation) ===")
     print(f"Training on 'train' subset of {filename}")
     print(f"Evaluating on 'test' subset of {filename}")
     print("Architecture: color -> order2 -> NCA -> order2 -> color")
+    print(f"D4 Augmentation: {'Enabled' if training_config.use_d4_augmentation else 'Disabled'}")
+    if training_config.use_d4_augmentation:
+        print(f"  Mode: {'Deterministic (8x data)' if training_config.d4_deterministic else 'Random'}")
 
     # Load train subset using data_loader.py
     (
@@ -948,7 +984,7 @@ def main(training_config: TrainingConfig):
         train_output_features,
         train_indices,
     ) = prepare_dataset(
-        "processed_data/train_all_d4aug.npz",
+        "processed_data/train_all.npz",
         filter_filename=f"{filename}.json",
         use_features=True,
         dataset_name="train",
@@ -985,36 +1021,57 @@ def main(training_config: TrainingConfig):
         [train_input_colors.flatten(), train_output_colors.flatten()]
     )
 
-    # Create dataloaders using data_loader.py
-    train_loader = create_dataloader(
-        train_inputs,
-        train_outputs,
-        batch_size=len(train_inputs),
-        shuffle=True,
-        num_workers=0,  # Eliminate multiprocessing overhead for small datasets
-        inputs_features=train_input_features,
-        outputs_features=train_output_features,
-        indices=train_indices,
-    )
-    val_loader = create_dataloader(
+    # Create dataloaders - use D4 augmentation for training if enabled
+    if training_config.use_d4_augmentation:
+        print(f"\nUsing D4 augmentation for training (deterministic={training_config.d4_deterministic})")
+        train_loader = create_d4_augmented_dataloader(
+            train_inputs,
+            train_outputs,
+            inputs_features=train_input_features,
+            outputs_features=train_output_features,
+            indices=train_indices,
+            batch_size=len(train_inputs) * (8 if training_config.d4_deterministic else 1),  # All transforms in one batch if deterministic
+            shuffle=True,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            augment=True,
+            deterministic_augmentation=training_config.d4_deterministic,
+            repeat_factor=10,
+        )
+    else:
+        print("\nTraining without D4 augmentation")
+        train_loader = create_dataloader(
+            train_inputs,
+            train_outputs,
+            batch_size=len(train_inputs),
+            shuffle=True,
+            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+            inputs_features=train_input_features,
+            outputs_features=train_output_features,
+            indices=train_indices,
+        )
+    
+    # Validation and test loaders don't use augmentation
+    val_loader = create_d4_augmented_dataloader(
         test_inputs,
         test_outputs,
-        batch_size=len(test_inputs),
-        shuffle=False,
-        num_workers=0,  # Eliminate multiprocessing overhead for small datasets
         inputs_features=test_input_features,
         outputs_features=test_output_features,
         indices=test_indices,
-    )
-    test_loader = create_dataloader(
-        test_inputs,
-        test_outputs,
-        batch_size=len(test_inputs),
+        batch_size=len(test_inputs),  # No augmentation for validation/test
         shuffle=False,
         num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+        augment=False,  # No augmentation for validation
+    )
+    test_loader = create_d4_augmented_dataloader(
+        test_inputs,
+        test_outputs,
         inputs_features=test_input_features,
         outputs_features=test_output_features,
         indices=test_indices,
+        batch_size=len(test_inputs),  # No augmentation for validation/test
+        shuffle=False,
+        num_workers=0,  # Eliminate multiprocessing overhead for small datasets
+        augment=False,  # No augmentation for test
     )
 
     # Create model with config hyperparameters
@@ -1068,6 +1125,7 @@ def main(training_config: TrainingConfig):
             callbacks=[checkpoint_callback],
             default_root_dir=training_config.checkpoint_dir,
             gradient_clip_val=1.0,
+            gradient_clip_algorithm="norm",
             logger=wandb_logger,  # type: ignore[arg-type]
             log_every_n_steps=1,
         )
@@ -1077,6 +1135,7 @@ def main(training_config: TrainingConfig):
             callbacks=[checkpoint_callback],
             default_root_dir=training_config.checkpoint_dir,
             gradient_clip_val=1.0,
+            gradient_clip_algorithm="norm",
             log_every_n_steps=1,
         )
 
