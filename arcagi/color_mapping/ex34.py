@@ -107,9 +107,6 @@ class TrainingConfig(BaseModel):
     # Model parameters
     filename: str = "3345333e"
 
-    # Noise parameters
-    noise_prob: float = 0.10
-    
     # D4 augmentation parameters
     use_d4_augmentation: bool = False
     d4_deterministic: bool = True  # If True, cycles through all 8 transformations
@@ -451,7 +448,6 @@ class MainModel(pl.LightningModule):
             RMSNorm(hidden_dim),
             nn.GELU(),
         )
-        self.noise_prob = 0.05
         self.linear_0 = nn.Linear(hidden_dim, 11)
 
         self.linear_1 = nn.Linear(hidden_dim, hidden_dim)
@@ -466,11 +462,13 @@ class MainModel(pl.LightningModule):
         )
         self.message_passing = SpatialMessagePassing(hidden_dim, dropout=dropout)
         self.drop = nn.Dropout(dropout)
+        self.drop1 = nn.Dropout(0.01)
         self.available_colors: list[int] | None = None
-        self.arsinh_norm2 = ArsinhNorm(hidden_dim)
+        self.arsinh_norm2a = ArsinhNorm(hidden_dim)
+        self.arsinh_norm2b = ArsinhNorm(hidden_dim)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, colors: ColorGrid) -> OneHot11:
+    def forward(self, colors: ColorGrid, step_type: Literal["train", "val"] = "train") -> OneHot11:
         """Return combined logits with channel 0 = mask (-1), channels 1..10 = colors 0..9.
         Shape: [B, 30, 30, 11]
         """
@@ -484,28 +482,22 @@ class MainModel(pl.LightningModule):
             apply_noise = t < max(
                 0, self.num_message_rounds - self.nca.num_final_steps
             )
-            h = h + 0.1 * self.nca(h, apply_noise=apply_noise)
+            if apply_noise:
+                h = self.drop1(h)
+            u = self.nca(h, apply_noise=apply_noise)
+            u = self.arsinh_norm2a(u)
+            h = h + 0.1 * u
             m = self.linear_1(self.message_passing(h))
             if apply_noise:
                 m = self.drop(m)
-            m = self.arsinh_norm2(m)
+            m = self.arsinh_norm2b(m)
             h = h + 0.1 * m
             self.frame_capture.capture(self.linear_0(h), round_idx=t)  # Single line injection
         combined_logits = self.linear_0(h)
         
         # Logits explosion detection
         current_logits_abs_mean = float(combined_logits.abs().mean().item())
-        self.log(f"logits_abs_mean", current_logits_abs_mean)  # type: ignore
-
-        if self.last_logits_abs_mean is not None and current_logits_abs_mean > 2 * self.last_logits_abs_mean:
-            print(f"\n!!! LOGITS EXPLOSION DETECTED IN FORWARD !!!")
-            print(f"Previous logits abs mean: {self.last_logits_abs_mean:.6f}")
-            print(f"Current logits abs mean: {current_logits_abs_mean:.6f}")
-            print(f"Ratio: {current_logits_abs_mean / self.last_logits_abs_mean:.2f}x")
-            print(f"Epoch: {self.current_epoch}")
-            print(f"Logits stats: min={combined_logits.min().item():.6f}, max={combined_logits.max().item():.6f}")
-            print(f"Hidden h stats: min={h.min().item():.6f}, max={h.max().item():.6f}, mean={h.mean().item():.6f}")
-        
+        self.log(f"{step_type}_logits_abs_mean", current_logits_abs_mean)  # type: ignore
         self.last_logits_abs_mean = current_logits_abs_mean
         
         self.frame_capture.capture(combined_logits, round_idx=self.num_message_rounds)  # Capture final state
@@ -538,7 +530,7 @@ class MainModel(pl.LightningModule):
 
         # Compute losses for color predictions (unchanged)
         metrics: Dict[int, Dict[str, float]] = {}
-        logits = self(i.inp.col)
+        logits = self(i.inp.col, step_type=step_type)
         logits_perm = logits.permute(0, 3, 1, 2)  # [B, 11, 30, 30]
         loss = cross_entropy_shifted(logits_perm, i.out.col.long(), start_index=-1)
         
@@ -919,7 +911,6 @@ def main(training_config: TrainingConfig):
     available_colors: torch.Tensor = torch.unique(all_colors_non_mask)  # type: ignore[call-arg]
     print(f"Available colors for {filename}: {available_colors}")
     model.available_colors = available_colors.tolist()  # type: ignore[no-untyped-call]
-    model.noise_prob = training_config.noise_prob
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
