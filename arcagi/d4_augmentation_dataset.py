@@ -129,7 +129,8 @@ class D4AugmentedDataset(Dataset):
         Get an item with D4 augmentation applied.
         
         Returns:
-            Tuple of (input, output, [input_features], [output_features], [index])
+            Tuple of (input, output, [input_features], [output_features], [index], transform_idx)
+            Note: transform_idx is always returned as the last element
         """
         if self.augment:
             if self.deterministic_augmentation:
@@ -172,6 +173,9 @@ class D4AugmentedDataset(Dataset):
         # Add index if it exists
         if self.indices is not None:
             return_items.append(self.indices[original_idx])
+        
+        # Always add transform index as the last item
+        return_items.append(transform_idx)
         
         return tuple(return_items)
 
@@ -233,30 +237,46 @@ class D4CollateFunction:
         
         Each item in the batch gets the same transformation applied to its
         input/output pair, but different items can get different transformations.
+        
+        Returns:
+            Tuple of tensors, with transform indices as the last tensor
         """
         # Transpose batch of tuples to tuple of lists
         batch_transposed = list(zip(*batch))
         
-        # Stack each component
-        tensors = [torch.stack(component) for component in batch_transposed]
+        # The last element should be transform indices (as integers)
+        # Convert to tensors, handling the transform indices specially
+        tensors = []
+        for i, component in enumerate(batch_transposed):
+            if i == len(batch_transposed) - 1:  # Last element is transform indices
+                # Convert list of integers to tensor
+                tensors.append(torch.tensor(component, dtype=torch.long))
+            else:
+                # Stack other components normally
+                tensors.append(torch.stack(component))
         
         if self.apply_random_d4:
             # Apply random D4 transform to each item in batch
             batch_size = len(tensors[0])
+            transform_indices = []
             
             for i in range(batch_size):
                 # Choose random transformation for this item
                 transform_idx = random.randint(0, self.num_transforms - 1)
+                transform_indices.append(transform_idx)
                 
                 # Apply same transform to input and output (first two tensors)
                 tensors[0][i] = self.apply_d4_transform(tensors[0][i], transform_idx)
                 tensors[1][i] = self.apply_d4_transform(tensors[1][i], transform_idx)
                 
                 # Apply to features if they exist (assuming they're tensors 2 and 3)
-                if len(tensors) > 2 and tensors[2].ndim >= 3:
+                if len(tensors) > 3 and tensors[2].ndim >= 3:
                     tensors[2][i] = self.apply_d4_transform(tensors[2][i], transform_idx)
-                if len(tensors) > 3 and tensors[3].ndim >= 3:
+                if len(tensors) > 4 and tensors[3].ndim >= 3:
                     tensors[3][i] = self.apply_d4_transform(tensors[3][i], transform_idx)
+            
+            # Update the transform indices tensor with the new values
+            tensors[-1] = torch.tensor(transform_indices, dtype=torch.long)
         
         return tuple(tensors)
 
@@ -297,7 +317,14 @@ def create_d4_augmented_dataloader(
             deterministic_augmentation=True).
         
     Returns:
-        DataLoader with D4 augmentation
+        DataLoader that yields batches with the following structure:
+        - (input, output, transform_indices) if no features/indices provided
+        - (input, output, input_features, transform_indices) if only input features provided
+        - (input, output, input_features, output_features, transform_indices) if both features provided
+        - (input, output, input_features, output_features, indices, transform_indices) if all provided
+        
+        Where transform_indices is a tensor of shape (batch_size,) containing values 0-7
+        indicating which D4 transformation was applied to each example.
     """
     dataset = D4AugmentedDataset(
         inputs=inputs,
@@ -372,11 +399,12 @@ if __name__ == "__main__":
     # Test the dataloader
     print("Testing augmented dataloader:")
     for i, batch in enumerate(train_loader):
-        if len(batch) == 5:
-            inp, out, inp_feat, out_feat, idx = batch
+        if len(batch) == 6:
+            inp, out, inp_feat, out_feat, idx, transform_idx = batch
             print(f"Batch {i}: Input shape: {inp.shape}, Output shape: {out.shape}")
             print(f"  Feature shapes: {inp_feat.shape}, {out_feat.shape}")
             print(f"  Indices: {idx}")
+            print(f"  Transform indices: {transform_idx}")
         else:
             print(f"Batch {i}: {len(batch)} tensors")
         
@@ -401,8 +429,9 @@ if __name__ == "__main__":
     print("Original output (first column):", test_output[0, :, 0, 0])
     
     for i in range(8):
-        inp, out = dataset[i]
+        inp, out, transform_idx = dataset[i]
         print(f"\nTransform {i}:")
         print("  Input shape:", inp.shape)
         print("  Output shape:", out.shape)
+        print("  Transform index:", transform_idx)
         # You can inspect the transformed tensors to verify they match

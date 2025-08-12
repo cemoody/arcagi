@@ -60,6 +60,7 @@ OneHot11: TypeAlias = "torch.Tensor"  # [B, 30, 30, 11] float
 Features45: TypeAlias = "torch.Tensor"  # [B, 30, 30, 45] float
 HiddenGrid: TypeAlias = "torch.Tensor"  # [B, 30, 30, H] float
 NCALatent: TypeAlias = "torch.Tensor"  # [B, D, 30, 30] float
+D4TransformType: TypeAlias = "torch.Tensor"  # [B, 30, 30] int
 try:
     from pytorch_lightning.loggers import WandbLogger  # type: ignore
 except Exception:
@@ -94,24 +95,24 @@ class TrainingConfig(BaseModel):
     max_epochs: int = 2000
     lr: float = 0.005
     weight_decay: float = 1e-9
-    hidden_dim: int = 64
+    feature_dim: int = 64
     num_message_rounds: int = 48
     num_final_steps: int = 12
     num_rounds_stop_prob: float = 0.10
 
     # Self-healing noise parameters
     enable_self_healing: bool = True
-    death_prob: float = 0.20
-    gaussian_std: float = 0.20
-    spatial_corruption_prob: float = 0.20
-    dropout: float = 0.05
-    dropout_h: float = 0.05
+    death_prob: float = 0.30
+    gaussian_std: float = 0.30
+    spatial_corruption_prob: float = 0.30
+    dropout: float = 0.15
+    dropout_h: float = 0.15
 
     # Model parameters
     filename: str = "3345333e"
 
     # D4 augmentation parameters
-    use_d4_augmentation: bool = False
+    use_d4_augmentation: bool = True
     d4_deterministic: bool = True  # If True, cycles through all 8 transformations
     
     # Adaptive gradient scaler parameters
@@ -350,7 +351,12 @@ class NeuralCellularAutomata2(nn.Module):
 def batch_to_dataclass(
     batch: List[torch.Tensor],
 ) -> BatchData:
-    inputs_one_hot, outputs_one_hot, input_features, output_features, indices = batch
+    # Check if we have transform indices (from D4 augmented dataloader)
+    if len(batch) == 6:
+        inputs_one_hot, outputs_one_hot, input_features, output_features, indices, transform_indices = batch
+    else:
+        inputs_one_hot, outputs_one_hot, input_features, output_features, indices = batch
+        transform_indices = None
 
     # Ensure features are float tensors for MPS compatibility
     input_features = input_features.float()
@@ -382,6 +388,7 @@ def batch_to_dataclass(
         colf=input_colors_flat,
         mskf=input_masks_flat.float(),
         idx=indices,
+        transform_idx=transform_indices,
     )
 
     out = Batch(
@@ -392,6 +399,7 @@ def batch_to_dataclass(
         colf=output_colors_flat,
         mskf=output_masks_flat.float(),
         idx=indices,
+        transform_idx=transform_indices,
     )
 
     return BatchData(inp=inp, out=out)
@@ -430,7 +438,7 @@ class MainModel(pl.LightningModule):
 
     def __init__(
         self,
-        hidden_dim: int = 64,
+        feature_dim: int = 64,
         num_message_rounds: int = 6,
         dropout: float = 0.0,
         dropout_h: float = 0.05,
@@ -448,11 +456,12 @@ class MainModel(pl.LightningModule):
         grad_scaler_warmup_steps: int = 500,
         grad_scaler_mult: float = 4.0,
         grad_scaler_z_thresh: float = 4.0,
+        dim_d4_embed: int = 8,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = hidden_dim = feature_dim + dim_d4_embed
         self.num_message_rounds = num_message_rounds
         self.num_rounds_stop_prob = num_rounds_stop_prob
         self.dropout = dropout
@@ -464,15 +473,15 @@ class MainModel(pl.LightningModule):
 
         # Feature processing and projection to NCA space
         self.feature_processor = nn.Sequential(
-            nn.Linear(dim_feat, hidden_dim),
-            RMSNorm(hidden_dim),
+            nn.Linear(dim_feat, feature_dim),
+            RMSNorm(feature_dim),
             nn.GELU(),
         )
         self.linear_0 = nn.Linear(hidden_dim, 11)
 
         self.linear_1 = nn.Linear(hidden_dim, hidden_dim)
         self.nca = NeuralCellularAutomata2(
-            hidden_dim,
+            hidden_dim * 2,
             dropout=dropout,
             enable_self_healing=enable_self_healing,
             death_prob=death_prob,
@@ -480,12 +489,13 @@ class MainModel(pl.LightningModule):
             spatial_corruption_prob=spatial_corruption_prob,
             num_final_steps=num_final_steps,
         )
-        self.message_passing = SpatialMessagePassing(hidden_dim, dropout=dropout)
+        self.message_passing = SpatialMessagePassing(hidden_dim * 2, dropout=dropout)
         self.drop = nn.Dropout(dropout)
         self.drop1 = nn.Dropout(dropout_h)
         self.available_colors: list[int] | None = None
         self.arsinh_norm2a = ArsinhNorm(hidden_dim)
         self.arsinh_norm2b = ArsinhNorm(hidden_dim)
+        self.d4_embed = nn.Embedding(8, dim_d4_embed)
         
         # Initialize adaptive gradient scaler
         self.enable_adaptive_grad_scaler = enable_adaptive_grad_scaler
@@ -499,14 +509,19 @@ class MainModel(pl.LightningModule):
             )
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, colors: ColorGrid, step_type: Literal["train", "val"] = "train") -> OneHot11:
+    def forward(self, colors: ColorGrid, d4_transform_type: D4TransformType,
+    step_type: Literal["train", "val"] = "train") -> OneHot11:
         """Return combined logits with channel 0 = mask (-1), channels 1..10 = colors 0..9.
         Shape: [B, 30, 30, 11]
         """
         with torch.no_grad():
             order2_raw = self.order2_encoder(colors)
 
-        o = self.feature_processor(order2_raw)  # shape [B, 30, 30, 64]
+        o1 = self.feature_processor(order2_raw)  # shape [B, 30, 30, 64]
+        d4_embed = self.d4_embed(d4_transform_type) # shape [B, 8]
+        # Broadcast d4_embed to match spatial dimensions [B, 8] -> [B, 30, 30, 8]
+        d4_embed = d4_embed.unsqueeze(1).unsqueeze(2).expand(-1, 30, 30, -1)
+        o = torch.cat([o1, d4_embed], dim=-1) # [B, 30, 30, 64 + 8]
         h = o
         self.frame_capture.capture(self.linear_0(h), round_idx=-1)  # Capture initial state
         for t in range(self.num_message_rounds):
@@ -517,10 +532,11 @@ class MainModel(pl.LightningModule):
                 break
             if apply_noise:
                 h = self.drop1(h)
-            u = self.nca(h, apply_noise=apply_noise)
+            oh = torch.cat([o, h], dim=-1)
+            u = self.nca(oh, apply_noise=apply_noise)
             u = self.arsinh_norm2a(u)
             h = h + 0.1 * u
-            m = self.linear_1(self.message_passing(h))
+            m = self.linear_1(self.message_passing(oh))
             if apply_noise:
                 m = self.drop(m)
             m = self.arsinh_norm2b(m)
@@ -563,7 +579,7 @@ class MainModel(pl.LightningModule):
 
         # Compute losses for color predictions (unchanged)
         metrics: Dict[int, Dict[str, float]] = {}
-        logits = self(i.inp.col, step_type=step_type)
+        logits = self(i.inp.col, i.inp.transform_idx, step_type=step_type)
         logits_perm = logits.permute(0, 3, 1, 2)  # [B, 11, 30, 30]
         loss = cross_entropy_shifted(logits_perm, i.out.col.long(), start_index=-1)
         
@@ -899,7 +915,7 @@ def main(training_config: TrainingConfig):
             num_workers=0,  # Eliminate multiprocessing overhead for small datasets
             augment=True,
             deterministic_augmentation=training_config.d4_deterministic,
-            repeat_factor=10,
+            repeat_factor=1,
         )
     else:
         print("\nTraining without D4 augmentation")
@@ -941,7 +957,7 @@ def main(training_config: TrainingConfig):
 
     # Create model with config hyperparameters
     model = MainModel(
-        hidden_dim=training_config.hidden_dim,
+        feature_dim=training_config.feature_dim,
         num_message_rounds=training_config.num_message_rounds,
         dropout=training_config.dropout,
         dropout_h=training_config.dropout_h,

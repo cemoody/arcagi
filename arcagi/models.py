@@ -16,6 +16,7 @@ class Batch:
     colf: torch.Tensor  # colors, flattened [B, 30*30]
     mskf: torch.Tensor  # masks, flattened [B, 30*30]
     idx: torch.Tensor  # indices [B]
+    transform_idx: torch.Tensor | None = None  # D4 transform indices [B], values 0-7
 
 
 @dataclass
@@ -44,6 +45,7 @@ def tile(batch: BatchData, n: int = 1) -> BatchData:
         colf=batch.inp.colf.repeat(n, 1),
         mskf=batch.inp.mskf.repeat(n, 1),
         idx=batch.inp.idx.repeat(n),
+        transform_idx=batch.inp.transform_idx.repeat(n) if batch.inp.transform_idx is not None else None,
     )
     
     # Tile output batch
@@ -55,6 +57,7 @@ def tile(batch: BatchData, n: int = 1) -> BatchData:
         colf=batch.out.colf.repeat(n, 1),
         mskf=batch.out.mskf.repeat(n, 1),
         idx=batch.out.idx.repeat(n),
+        transform_idx=batch.out.transform_idx.repeat(n) if batch.out.transform_idx is not None else None,
     )
     
     return BatchData(inp=inp_tiled, out=out_tiled)

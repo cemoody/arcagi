@@ -54,20 +54,27 @@ class FrameCapture:
         if not self.frames:
             raise ValueError("No frames captured")
         
-        # Default ARC color palette
+        # Default color palette matching terminal_imshow.py ANSI colors
         if color_map is None:
+            # Standard ANSI color palette (approximated in RGB)
             color_map = {
                 0: (0, 0, 0),        # Black
-                1: (0, 116, 217),    # Blue
-                2: (255, 65, 54),    # Red
-                3: (46, 204, 64),    # Green
-                4: (255, 220, 0),    # Yellow
-                5: (128, 128, 128),  # Gray
-                6: (240, 18, 190),   # Magenta
-                7: (255, 133, 27),   # Orange
-                8: (0, 191, 255),    # Sky Blue
-                9: (149, 0, 58),     # Maroon
-                -1: (255, 255, 255), # White (for mask)
+                1: (170, 0, 0),      # Red
+                2: (0, 170, 0),      # Green
+                3: (170, 85, 0),     # Yellow/Brown
+                4: (0, 0, 170),      # Blue
+                5: (170, 0, 170),    # Magenta
+                6: (0, 170, 170),    # Cyan
+                7: (170, 170, 170),  # White/Light Gray
+                8: (85, 85, 85),     # Bright Black/Dark Gray
+                9: (255, 85, 85),    # Bright Red
+                10: (85, 255, 85),   # Bright Green
+                11: (255, 255, 85),  # Bright Yellow
+                12: (85, 85, 255),   # Bright Blue
+                13: (255, 85, 255),  # Bright Magenta
+                14: (85, 255, 255),  # Bright Cyan
+                15: (255, 255, 255), # Bright White
+                -1: (0, 0, 0),       # Background (same as black)
             }
         
         pil_images = []
@@ -81,7 +88,13 @@ class FrameCapture:
             if frame.dim() == 3:
                 # If it's [H, W, C] with C > 3, likely logits - take argmax
                 if frame.shape[-1] > 3:
+                    # For 11-channel logits (mask + 10 colors), adjust indices after argmax
+                    # Channel 0 = mask (-1), channels 1-10 = colors 0-9
+                    is_11_channel = frame.shape[-1] == 11
                     frame = frame.argmax(dim=-1)
+                    if is_11_channel:
+                        # Convert: argmax 0 -> -1 (mask), argmax 1-10 -> 0-9 (colors)
+                        frame = torch.where(frame == 0, -1, frame - 1)
                 # If it's [C, H, W] format, transpose
                 elif frame.shape[0] <= 3:
                     frame = frame.permute(1, 2, 0)

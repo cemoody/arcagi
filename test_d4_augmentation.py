@@ -67,11 +67,12 @@ class TestD4AugmentedDataset:
         
         # Test indexing
         sample = dataset[0]
-        assert len(sample) == 2
+        assert len(sample) == 3  # Now includes transform index
         assert sample[0].shape == inputs[0].shape
         assert sample[1].shape == outputs[0].shape
         assert torch.allclose(sample[0], inputs[0])
         assert torch.allclose(sample[1], outputs[0])
+        assert sample[2] == 0  # Transform index should be 0 for no augmentation
     
     def test_deterministic_augmentation(self, simple_data):
         """Test that deterministic augmentation creates 8x samples."""
@@ -90,7 +91,16 @@ class TestD4AugmentedDataset:
         # Check that we can access all augmented samples
         for i in range(len(dataset)):
             sample = dataset[i]
-            assert len(sample) == 2
+            assert len(sample) == 3  # Now includes transform index
+            
+        # Check that transform indices cycle through 0-7
+        # With deterministic augmentation, first n_samples have transform 0,
+        # next n_samples have transform 1, etc.
+        for transform in range(8):
+            for sample_idx in range(n_samples):
+                dataset_idx = transform * n_samples + sample_idx
+                sample = dataset[dataset_idx]
+                assert sample[2] == transform, f"Expected transform {transform} at index {dataset_idx}, got {sample[2]}"
     
     def test_transformation_correctness(self, test_pattern):
         """Test that D4 transformations are applied correctly."""
@@ -106,21 +116,25 @@ class TestD4AugmentedDataset:
         )
         
         # Test identity transformation (index 0)
-        inp, out = dataset[0]
+        inp, out, transform_idx = dataset[0]
+        assert transform_idx == 0
         assert torch.allclose(inp[:, :, 0], inputs[0, :, :, 0])
         
         # Test 90 degree rotation (index 1)
-        inp, out = dataset[1]
+        inp, out, transform_idx = dataset[1]
+        assert transform_idx == 1
         expected_rot90 = torch.rot90(inputs[0, :, :, 0], k=-1, dims=(0, 1))
         assert torch.allclose(inp[:, :, 0], expected_rot90)
         
         # Test 180 degree rotation (index 2)
-        inp, out = dataset[2]
+        inp, out, transform_idx = dataset[2]
+        assert transform_idx == 2
         expected_rot180 = torch.rot90(inputs[0, :, :, 0], k=2, dims=(0, 1))
         assert torch.allclose(inp[:, :, 0], expected_rot180)
         
         # Test horizontal flip (index 4)
-        inp, out = dataset[4]
+        inp, out, transform_idx = dataset[4]
+        assert transform_idx == 4
         expected_flip = torch.flip(inputs[0, :, :, 0], dims=[1])
         assert torch.allclose(inp[:, :, 0], expected_flip)
     
@@ -149,8 +163,9 @@ class TestD4AugmentedDataset:
             4: ((0, 3), (3, 0)),  # Horizontal flip - top-left goes to top-right, bottom-right goes to bottom-left
         }
         
-        for transform_idx, (exp_inp, exp_out) in expected_positions.items():
-            inp, out = dataset[transform_idx]
+        for expected_transform_idx, (exp_inp, exp_out) in expected_positions.items():
+            inp, out, actual_transform_idx = dataset[expected_transform_idx]
+            assert actual_transform_idx == expected_transform_idx
             
             # Find where the markers ended up
             inp_marker_pos = torch.nonzero(inp[:, :, 0] == 1.0)
@@ -179,14 +194,15 @@ class TestD4AugmentedDataset:
         
         # Test that all components are returned
         sample = dataset[0]
-        assert len(sample) == 5
+        assert len(sample) == 6  # Now includes transform index
         
-        inp, out, inp_feat, out_feat, idx = sample
+        inp, out, inp_feat, out_feat, idx, transform_idx = sample
         assert inp.shape == inputs[0].shape
         assert out.shape == outputs[0].shape
         assert inp_feat.shape == input_features[0].shape
         assert out_feat.shape == output_features[0].shape
         assert idx < len(inputs)
+        assert 0 <= transform_idx < 8  # Transform index should be valid
     
     def test_random_augmentation(self, simple_data):
         """Test random augmentation mode."""
@@ -238,11 +254,14 @@ class TestD4DataLoader:
         # Test iteration
         batch_count = 0
         for batch in train_loader:
-            inp_batch, out_batch = batch
+            assert len(batch) == 3  # inputs, outputs, transform_indices
+            inp_batch, out_batch, transform_indices = batch
             assert inp_batch.shape[0] <= batch_size
             assert out_batch.shape[0] <= batch_size
             assert inp_batch.shape[1:] == inputs.shape[1:]
             assert out_batch.shape[1:] == outputs.shape[1:]
+            assert transform_indices.shape == (inp_batch.shape[0],)
+            assert torch.all((transform_indices >= 0) & (transform_indices < 8))
             batch_count += 1
         
         assert batch_count > 0
@@ -261,9 +280,11 @@ class TestD4DataLoader:
         
         # Check that data is unchanged
         for batch in val_loader:
-            inp_batch, out_batch = batch
+            assert len(batch) == 3
+            inp_batch, out_batch, transform_indices = batch
             assert torch.allclose(inp_batch, inputs)
             assert torch.allclose(out_batch, outputs)
+            assert torch.all(transform_indices == 0)  # No augmentation means all transform indices are 0
             break  # Only one batch expected
     
     def test_deterministic_dataloader(self):
@@ -305,8 +326,10 @@ class TestD4DataLoader:
 
         total_seen = 0
         for batch in loader:
-            inp_batch, out_batch = batch[:2]
+            assert len(batch) == 3
+            inp_batch, out_batch, transform_indices = batch
             assert inp_batch.shape[0] <= batch_size
+            assert transform_indices.shape == (inp_batch.shape[0],)
             total_seen += inp_batch.shape[0]
 
         base = n_samples * (8 if deterministic else 1)
@@ -318,24 +341,30 @@ class TestD4CollateFunction:
     
     def test_collate_basic(self):
         """Test basic collate functionality."""
-        # Create simple batch
+        # Create simple batch with transform indices
         batch = [
-            (torch.ones(4, 4, 1), torch.zeros(4, 4, 1)),
-            (torch.ones(4, 4, 1) * 2, torch.zeros(4, 4, 1)),
-            (torch.ones(4, 4, 1) * 3, torch.zeros(4, 4, 1)),
+            (torch.ones(4, 4, 1), torch.zeros(4, 4, 1), 0),
+            (torch.ones(4, 4, 1) * 2, torch.zeros(4, 4, 1), 1),
+            (torch.ones(4, 4, 1) * 3, torch.zeros(4, 4, 1), 2),
         ]
         
         collate_fn = D4CollateFunction(apply_random_d4=False)
         result = collate_fn(batch)
         
-        assert len(result) == 2
+        assert len(result) == 3  # Now includes transform indices
         assert result[0].shape == (3, 4, 4, 1)
         assert result[1].shape == (3, 4, 4, 1)
+        assert result[2].shape == (3,)  # Transform indices
         
         # Check values are preserved when no augmentation
         assert torch.allclose(result[0][0], batch[0][0])
         assert torch.allclose(result[0][1], batch[1][0])
         assert torch.allclose(result[0][2], batch[2][0])
+        
+        # Check transform indices
+        assert result[2][0] == 0
+        assert result[2][1] == 1
+        assert result[2][2] == 2
     
     def test_collate_with_augmentation(self):
         """Test collate with augmentation."""
@@ -345,13 +374,14 @@ class TestD4CollateFunction:
             inp = torch.zeros(4, 4, 1)
             inp[0, 0, 0] = i + 1  # Different marker for each
             out = torch.zeros(4, 4, 1)
-            batch.append((inp, out))
+            batch.append((inp, out, 0))  # Add initial transform index
         
         collate_fn = D4CollateFunction(apply_random_d4=True)
         result = collate_fn(batch)
         
-        assert len(result) == 2
+        assert len(result) == 3  # Now includes transform indices
         assert result[0].shape == (3, 4, 4, 1)
+        assert result[2].shape == (3,)  # Transform indices
         
         # At least some samples should be transformed
         # (with very low probability all could be identity)
@@ -362,6 +392,9 @@ class TestD4CollateFunction:
             marker_pos = torch.nonzero(result[0][i, :, :, 0] == i + 1)
             if len(marker_pos) == 1 and tuple(marker_pos[0].tolist()) != original_positions[i]:
                 transformed_count += 1
+        
+        # Check that transform indices are valid
+        assert torch.all((result[2] >= 0) & (result[2] < 8))
         
         # This test might rarely fail due to randomness, but it's very unlikely
         # all 3 samples get identity transform (probability = (1/8)^3 ≈ 0.002)
