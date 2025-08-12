@@ -111,7 +111,7 @@ class TrainingConfig(BaseModel):
     spatial_corruption_prob: float = 0.01
 
     # Model parameters
-    dropout: float = 0.05
+    dropout: float = 0.01
     temperature: float = 1.0
     filename: str = "3345333e"
 

@@ -256,12 +256,12 @@ if atq | grep -q "shutdown"; then
     echo "Auto-shutdown is already scheduled:"
     atq | grep "shutdown"
 else
-    echo "sudo shutdown -h +180" | at now
+    echo "sudo shutdown -h +480" | at now
     if [ $? -eq 0 ]; then
-        echo "Auto-shutdown scheduled for 3 hours from now"
+        echo "Auto-shutdown scheduled for 8 hours from now"
     else
         echo "Failed to schedule with 'at', falling back to manual reminder"
-        echo "To manually shutdown in 3 hours, run: sudo shutdown -h +180"
+        echo "To manually shutdown in 8 hours, run: sudo shutdown -h +480"
     fi
 fi
 
