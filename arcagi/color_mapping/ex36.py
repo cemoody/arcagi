@@ -837,36 +837,35 @@ class MainModel(pl.LightningModule):
         start_index: int = -1,
     ) -> None:
         """Visualize predictions vs ground truth for training."""
-        # Visualize first N items in the batch for simplicity
-        batch_size = int(targets.size(0))
-        for b in range(batch_size):
-            pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
-            true_colors = targets[b].cpu()
+        # Only visualize the first example in the batch
+        b = 0  # First example only
+        pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
+        true_colors = targets[b].cpu()
 
-            # Create visualization
-            print(f"\n{'='*60}")
-            print(f"{prefix.upper()} - Epoch {self.current_epoch}")
-            print(f"{'='*60}")
+        # Create visualization
+        print(f"\n{'='*60}")
+        print(f"{prefix.upper()} - Epoch {self.current_epoch}")
+        print(f"{'='*60}")
 
-            # Show ground truth
-            print("\nGround Truth colors:")
-            imshow(true_colors, title=None, show_legend=True)
+        # Show ground truth
+        print("\nGround Truth colors:")
+        imshow(true_colors, title=None, show_legend=True)
 
-            # Show predictions
-            print("\nPredicted colors:")
-            correct = (true_colors == pred_colors) | (true_colors == -1)
-            imshow(pred_colors, title=None, show_legend=True, correct=correct)
+        # Show predictions
+        print("\nPredicted colors:")
+        correct = (true_colors == pred_colors) | (true_colors == -1)
+        imshow(pred_colors, title=None, show_legend=True, correct=correct)
 
-            # Calculate accuracy for this example
-            valid_mask = true_colors != -1
-            if valid_mask.any():
-                accuracy = (
-                    (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
-                )
+        # Calculate accuracy for this example
+        valid_mask = true_colors != -1
+        if valid_mask.any():
+            accuracy = (
+                (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
+            )
 
-                # Also show mask predictions vs ground truth
-                print("\nMask predictions (True=active pixel, False=inactive):")
-                print(f"\nColor Accuracy: {accuracy:.2%}")
+            # Also show mask predictions vs ground truth
+            print("\nMask predictions (True=active pixel, False=inactive):")
+            print(f"\nColor Accuracy: {accuracy:.2%}")
 
 
 @click.command()

@@ -325,37 +325,13 @@ class ContextModulatedNeighborhoodAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scale = qk_scale or self.head_dim**-0.5
-
-        # Base QKV projection
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
+        self.kernel_size = kernel_size
+        self.dilation = dilation
 
         # Context-modulated QKV projections using bilinear LoRA
         self.qkv_modulation = ContextModulatedLinear(
             embed_dim, embed_dim * 3, context_dim, lora_rank
         )
-
-        # Native NATTEN attention if available
-        if NATTEN_AVAILABLE:
-            self.natten = NeighborhoodAttention2D(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                qkv_bias=False,  # We handle QKV ourselves
-                qk_scale=qk_scale,
-                proj_drop=proj_drop,
-            )
-            self.use_natten = True
-        else:
-            # Fallback implementation
-            self.conv = nn.Conv2d(
-                embed_dim,
-                embed_dim,
-                kernel_size=kernel_size,
-                padding=kernel_size // 2,
-                groups=1,  # Use single group for compatibility
-            )
-            self.use_natten = False
 
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -370,36 +346,70 @@ class ContextModulatedNeighborhoodAttention(nn.Module):
         """
         B, H, W, C = x.shape
 
-        # Get base QKV
-        qkv_base = self.qkv(x)  # [B, H, W, 3C]
-
         # Get context-modulated QKV
-        qkv_modulated = self.qkv_modulation(x, context)  # [B, H, W, 3C]
+        qkv = self.qkv_modulation(x, context)  # [B, H, W, 3C]
 
-        # The modulation is already gated inside ContextModulatedLinear
-        qkv = qkv_modulated
+        # Reshape for attention computation
+        qkv = qkv.reshape(B, H, W, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(3, 0, 4, 1, 2, 5)  # [3, B, num_heads, H, W, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: [B, num_heads, H, W, head_dim]
 
-        if self.use_natten:
-            # Reshape for NATTEN
-            qkv = qkv.reshape(B, H, W, 3, self.num_heads, self.head_dim)
-            qkv = qkv.permute(3, 0, 4, 1, 2, 5)  # [3, B, num_heads, H, W, head_dim]
-            q, k, v = qkv[0], qkv[1], qkv[2]
-
-            # Apply neighborhood attention
-            # NATTEN expects [B, num_heads, H, W, head_dim]
-            attn_out = self.natten._forward_qkv(q, k, v)  # Use internal method
-
-            # Reshape back
-            attn_out = attn_out.permute(0, 2, 3, 1, 4)  # [B, H, W, num_heads, head_dim]
-            attn_out = attn_out.reshape(B, H, W, C)
+        # Apply local attention with unfold operation
+        # Unfold creates windows of size kernel_size around each position
+        pad = self.dilation * (self.kernel_size - 1) // 2
+        
+        # Pad k and v for neighborhood extraction
+        if pad > 0:
+            k_padded = F.pad(k, (0, 0, pad, pad, pad, pad), mode='constant', value=0)
+            v_padded = F.pad(v, (0, 0, pad, pad, pad, pad), mode='constant', value=0)
         else:
-            # Fallback: use convolution
-            x_2d = x.permute(0, 3, 1, 2)  # [B, C, H, W]
-            attn_out = self.conv(x_2d)
-            attn_out = attn_out.permute(0, 2, 3, 1)  # [B, H, W, C]
+            k_padded = k
+            v_padded = v
+
+        # Extract neighborhoods using unfold
+        # k_padded: [B, num_heads, H+2*pad, W+2*pad, head_dim]
+        k_unfolded = F.unfold(
+            k_padded.reshape(B * self.num_heads, H + 2*pad, W + 2*pad, self.head_dim).permute(0, 3, 1, 2),
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=0,
+            stride=1
+        )  # [B*num_heads, head_dim*kernel_size^2, H*W]
+        
+        v_unfolded = F.unfold(
+            v_padded.reshape(B * self.num_heads, H + 2*pad, W + 2*pad, self.head_dim).permute(0, 3, 1, 2),
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=0,
+            stride=1
+        )  # [B*num_heads, head_dim*kernel_size^2, H*W]
+
+        # Reshape unfolded tensors
+        k_unfolded = k_unfolded.reshape(B, self.num_heads, self.head_dim, self.kernel_size**2, H*W)
+        k_unfolded = k_unfolded.permute(0, 1, 4, 3, 2)  # [B, num_heads, H*W, kernel_size^2, head_dim]
+        
+        v_unfolded = v_unfolded.reshape(B, self.num_heads, self.head_dim, self.kernel_size**2, H*W)
+        v_unfolded = v_unfolded.permute(0, 1, 4, 3, 2)  # [B, num_heads, H*W, kernel_size^2, head_dim]
+
+        # Reshape q for attention
+        q = q.reshape(B, self.num_heads, H*W, self.head_dim)
+
+        # Compute attention scores
+        attn = torch.matmul(q.unsqueeze(3), k_unfolded.transpose(-2, -1))  # [B, num_heads, H*W, 1, kernel_size^2]
+        attn = attn.squeeze(3) * self.scale  # [B, num_heads, H*W, kernel_size^2]
+
+        # Apply softmax
+        attn = F.softmax(attn, dim=-1)
+
+        # Apply attention to values
+        out = torch.matmul(attn.unsqueeze(3), v_unfolded).squeeze(3)  # [B, num_heads, H*W, head_dim]
+
+        # Reshape back
+        out = out.reshape(B, self.num_heads, H, W, self.head_dim)
+        out = out.permute(0, 2, 3, 1, 4).reshape(B, H, W, C)
 
         # Output projection
-        out = self.proj(attn_out)
+        out = self.proj(out)
         out = self.proj_drop(out)
 
         return out
@@ -923,12 +933,13 @@ def cross_entropy_shifted(
 class MainModel(pl.LightningModule):
     """Order2 + NCA model that outputs 11-class logits (-1 mask + 10 colors)."""
 
-    training_index_metrics: Dict[int, Dict[str, int]] = {}
-    validation_index_metrics: Dict[int, Dict[str, int]] = {}
+    training_index_metrics: Dict[tuple[str, int], Dict[str, int]] = {}
+    validation_index_metrics: Dict[tuple[str, int], Dict[str, int]] = {}
     force_visualize: bool = False
     last_max_loss: Optional[float] = None
     last_logits_abs_mean: Optional[float] = None
     frame_capture: FrameCapture = FrameCapture()
+    file_id_to_name: Dict[int, str] = {}  # Reverse mapping for file IDs
 
     def __init__(
         self,
@@ -984,11 +995,25 @@ class MainModel(pl.LightningModule):
             self.file_context_embedding = None
 
         # Replace NCA and message passing with local attention stack
-        # hidden_dim = 72 (64 + 8), so we need num_heads that divides evenly
-        # and gives head_dim that's a multiple of 8
-        # 72 / 9 = 8 (head_dim = 8, which is good for NATTEN)
-        # For debug mode with hidden_dim=24 (16 + 8), use 4 heads
-        num_heads = 4 if hidden_dim == 24 else 9
+        # Choose num_heads that divides hidden_dim evenly
+        # Prefer head_dim to be 8 or 16 for better performance
+        if hidden_dim % 8 == 0:
+            # Try to get head_dim = 8
+            num_heads = hidden_dim // 8
+        elif hidden_dim % 16 == 0:
+            # Try to get head_dim = 16
+            num_heads = hidden_dim // 16
+        elif hidden_dim % 4 == 0:
+            # Fallback to head_dim = 4
+            num_heads = hidden_dim // 4
+        else:
+            # Last resort: use as many heads as possible
+            for h in range(min(16, hidden_dim), 0, -1):
+                if hidden_dim % h == 0:
+                    num_heads = h
+                    break
+            else:
+                num_heads = 1  # Fallback to single head
         self.attention_stack = LocalAttentionStack(
             hidden_dim=hidden_dim,
             num_layers=4,  # 4 layers of local attention
@@ -1133,6 +1158,17 @@ class MainModel(pl.LightningModule):
         # Get file IDs if available
         file_ids = getattr(i.inp, "file_ids", None)
 
+        # Create file ID to name mapping if not already done
+        if (
+            self.enable_file_context
+            and file_ids is not None 
+            and self.file_context_embedding is not None
+            and not self.file_id_to_name
+        ):
+            # Build reverse mapping from file_context_embedding
+            for filename, file_id in self.file_context_embedding.filename_to_id.items():
+                self.file_id_to_name[file_id] = filename
+
         # Debug logging for multi-file training
         if (
             self.enable_file_context
@@ -1202,15 +1238,32 @@ class MainModel(pl.LightningModule):
                 logits,
                 f"step-{step_type}",
             )
-        # Convert float metrics to int for compatibility
-        int_metrics: Dict[int, Dict[str, int]] = {}
+        
+        # Convert metrics to use (filename, index) tuples as keys
+        int_metrics: Dict[tuple[str, int], Dict[str, int]] = {}
         for idx, m in metrics.items():
-            int_metrics[idx] = {k: int(v) for k, v in m.items()}
+            # Determine filename for this index
+            if file_ids is not None and self.file_id_to_name:
+                # Find the file ID for this example index in the batch
+                batch_indices = i.out.idx
+                mask = batch_indices == idx
+                if mask.any():
+                    # Get the file ID for this example
+                    example_file_id = file_ids[mask][0].item()
+                    filename = self.file_id_to_name.get(example_file_id, f"file_{example_file_id}")
+                else:
+                    filename = "unknown"
+            else:
+                # Single file mode - use the configured filename
+                filename = getattr(self, '_training_filename', 'single_file')
+            
+            key = (filename, idx)
+            int_metrics[key] = {k: int(v) for k, v in m.items()}
 
         if step_type == "train":
-            self.training_index_metrics = int_metrics
+            self.training_index_metrics.update(int_metrics)
         else:
-            self.validation_index_metrics = int_metrics
+            self.validation_index_metrics.update(int_metrics)
 
         # Only log metrics during training or validation, not during manual test evaluation
         try:
@@ -1254,10 +1307,10 @@ class MainModel(pl.LightningModule):
         self.log("grad_total_norm", total_norm, on_step=True, prog_bar=False)
 
     def log_metrics(
-        self, metrics: Dict[int, Dict[str, int]], prefix: str = "train"
+        self, metrics: Dict[tuple[str, int], Dict[str, int]], prefix: str = "train"
     ) -> None:
-        for idx in metrics.keys():
-            for key, value in metrics[idx].items():
+        for (filename, idx) in metrics.keys():
+            for key, value in metrics[(filename, idx)].items():
                 self.log(f"{prefix}_{key}", value)  # type: ignore
 
     def on_train_epoch_end(self) -> None:
@@ -1327,30 +1380,41 @@ class MainModel(pl.LightningModule):
     def epoch_end(self, step_type: Literal["train", "val"]) -> None:
         if step_type == "train":
             metrics = self.training_index_metrics
+            prefix = "train"
         else:
             metrics = self.validation_index_metrics
+            prefix = "val"
 
         if metrics:
             print(
                 f"\n{step_type.upper()} Per-Index Accuracy (Epoch {self.current_epoch}):"
             )
             print(
-                f"{'Index':<8} {'Output Pixels':<12} {'Output Mask':<12} {'All Perfect':<12}"
+                f"{'Filename':<20} {'Index':<8} {'Output Pixels':<12} {'Output Mask':<12} {'All Perfect':<12}"
             )
-            print("-" * 50)
+            print("-" * 65)
 
-            for idx in sorted(self.training_index_metrics.keys()):
-                metrics = self.training_index_metrics[idx]
-                out_pix_incor = metrics["train_n_incorrect_num_color"]
-                out_msk_incor = metrics["train_n_incorrect_num_mask"]
+            # Sort by filename first, then by index
+            sorted_keys = sorted(metrics.keys(), key=lambda x: (x[0], x[1]))
+            
+            for key in sorted_keys:
+                filename, idx = key
+                m = metrics[key]
+                out_pix_incor = m[f"{prefix}_n_incorrect_num_color"]
+                out_msk_incor = m[f"{prefix}_n_incorrect_num_mask"]
 
                 all_perfect = "✓" if out_pix_incor == 0 else "✗"
+                # Truncate filename if too long
+                display_filename = filename if len(filename) <= 18 else filename[:15] + "..."
                 print(
-                    f"{idx:<8} {out_pix_incor:<12} {out_msk_incor:<12} {all_perfect:<12}"
+                    f"{display_filename:<20} {idx:<8} {out_pix_incor:<12} {out_msk_incor:<12} {all_perfect:<12}"
                 )
 
-        # Clear training metrics for next epoch
-        self.training_index_metrics = {}
+        # Clear metrics for next epoch
+        if step_type == "train":
+            self.training_index_metrics = {}
+        else:
+            self.validation_index_metrics = {}
 
     def configure_optimizers(self):  # type: ignore[override]
         # Use AdamW optimizer
@@ -1394,36 +1458,35 @@ class MainModel(pl.LightningModule):
         start_index: int = -1,
     ) -> None:
         """Visualize predictions vs ground truth for training."""
-        # Visualize first N items in the batch for simplicity
-        batch_size = int(targets.size(0))
-        for b in range(batch_size):
-            pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
-            true_colors = targets[b].cpu()
+        # Only visualize the first example in the batch
+        b = 0  # First example only
+        pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
+        true_colors = targets[b].cpu()
 
-            # Create visualization
-            print(f"\n{'='*60}")
-            print(f"{prefix.upper()} - Epoch {self.current_epoch}")
-            print(f"{'='*60}")
+        # Create visualization
+        print(f"\n{'='*60}")
+        print(f"{prefix.upper()} - Epoch {self.current_epoch}")
+        print(f"{'='*60}")
 
-            # Show ground truth
-            print("\nGround Truth colors:")
-            imshow(true_colors, title=None, show_legend=True)
+        # Show ground truth
+        print("\nGround Truth colors:")
+        imshow(true_colors, title=None, show_legend=True)
 
-            # Show predictions
-            print("\nPredicted colors:")
-            correct = (true_colors == pred_colors) | (true_colors == -1)
-            imshow(pred_colors, title=None, show_legend=True, correct=correct)
+        # Show predictions
+        print("\nPredicted colors:")
+        correct = (true_colors == pred_colors) | (true_colors == -1)
+        imshow(pred_colors, title=None, show_legend=True, correct=correct)
 
-            # Calculate accuracy for this example
-            valid_mask = true_colors != -1
-            if valid_mask.any():
-                accuracy = (
-                    (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
-                )
+        # Calculate accuracy for this example
+        valid_mask = true_colors != -1
+        if valid_mask.any():
+            accuracy = (
+                (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
+            )
 
-                # Also show mask predictions vs ground truth
-                print("\nMask predictions (True=active pixel, False=inactive):")
-                print(f"\nColor Accuracy: {accuracy:.2%}")
+            # Also show mask predictions vs ground truth
+            print("\nMask predictions (True=active pixel, False=inactive):")
+            print(f"\nColor Accuracy: {accuracy:.2%}")
 
 
 @click.command()
@@ -1458,7 +1521,7 @@ def main(training_config: TrainingConfig):
         print(f"Training on 'train' subset of {filename}")
         print(f"Evaluating on 'test' subset of {filename}")
         print("Architecture: color -> order2 -> local attention stack -> color")
-    print(f"NATTEN available: {NATTEN_AVAILABLE}")
+    print(f"Using convolution-based local attention")
     print(
         f"D4 Augmentation: {'Enabled' if training_config.use_d4_augmentation else 'Disabled'}"
     )
@@ -1500,6 +1563,10 @@ def main(training_config: TrainingConfig):
         enable_file_context=(training_config.experiment_type == "multi_file"),
     )
 
+    # Store training filename for single-file mode
+    if training_config.experiment_type != "multi_file":
+        setattr(model, '_training_filename', training_config.filename)
+
     if training_config.experiment_type == "multi_file":
         # Multi-file training
         print("\nLoading data from multiple files...")
@@ -1513,7 +1580,7 @@ def main(training_config: TrainingConfig):
             file_context_embedding=model.file_context_embedding,
             training_config=training_config,
             dataset_name="train",
-            batch_size=None,  # Use all data
+            batch_size=2,  # Very small batch size to avoid OOM with D4 augmentation
             shuffle=True,
         )
 
@@ -1523,7 +1590,7 @@ def main(training_config: TrainingConfig):
             file_context_embedding=model.file_context_embedding,
             training_config=training_config,
             dataset_name="test",
-            batch_size=None,  # Use all data
+            batch_size=1,  # Process one example at a time for validation
             shuffle=False,
         )
 
