@@ -15,6 +15,8 @@ from typing import (
     Literal,
     TypeAlias,
     TypeVar,
+    Union,
+    Optional,
 )
 
 import click
@@ -161,10 +163,18 @@ class SpatialMessagePassing(nn.Module):
     """Efficient spatial message passing for local consistency."""
 
     def __init__(
-        self: "SpatialMessagePassing", hidden_dim: int, dropout: float = 0.0
+        self: "SpatialMessagePassing", hidden_dim: int, out_dim: int, context_dim: Optional[int] = None, dropout: float = 0.0
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.context_dim = context_dim
+        
+        # Input dimension is hidden_dim + context_dim if context is used
+        input_dim = hidden_dim + (context_dim if context_dim else 0)
+        
+        # Project from potentially concatenated input to hidden_dim for convolution
+        self.input_proj = nn.Linear(input_dim, hidden_dim) if context_dim else None
         
         # Ensure groups divides hidden_dim evenly
         groups = hidden_dim // 16 if hidden_dim >= 16 else 1
@@ -174,18 +184,25 @@ class SpatialMessagePassing(nn.Module):
         
         self.conv = nn.Conv2d(
             hidden_dim,
-            hidden_dim,
+            out_dim,
             kernel_size=3,
             padding=1,
             groups=groups,
         )
-        self.norm = RMSNorm(hidden_dim)
+        self.norm = RMSNorm(out_dim)
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, h: HiddenGrid) -> HiddenGrid:
-        h_conv = h.permute(0, 3, 1, 2)
+    def forward(self, h: HiddenGrid, context: Optional[HiddenGrid] = None) -> HiddenGrid:
+        # Concatenate context if provided
+        if context is not None and self.context_dim is not None:
+            h_with_context = torch.cat([h, context], dim=-1)
+            h_proj = self.input_proj(h_with_context)
+        else:
+            h_proj = h
+            
+        h_conv = h_proj.permute(0, 3, 1, 2)
         messages = self.conv(h_conv)
         messages = messages.permute(0, 2, 3, 1)
         messages = self.norm(messages)
@@ -231,6 +248,8 @@ class NeuralCellularAutomata2(nn.Module):
     def __init__(
         self: "NeuralCellularAutomata2",
         hidden_dim: int,
+        out_dim: int,
+        context_dim: Optional[int] = None,
         dropout: float = 0.05,
         enable_self_healing: bool = True,
         death_prob: float = 0.05,
@@ -240,7 +259,15 @@ class NeuralCellularAutomata2(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.context_dim = context_dim
         self.num_final_steps = num_final_steps
+        
+        # Input dimension is hidden_dim + context_dim if context is used
+        input_dim = hidden_dim + (context_dim if context_dim else 0)
+        
+        # Project from potentially concatenated input to hidden_dim for perception
+        self.input_proj = nn.Linear(input_dim, hidden_dim) if context_dim else None
 
         self.perception_conv = nn.Conv2d(
             hidden_dim,
@@ -265,7 +292,7 @@ class NeuralCellularAutomata2(nn.Module):
             nn.Conv2d(perception_dim, hidden_dim * 2, 1),
             nn.GELU(),
             nn.Dropout2d(dropout),
-            nn.Conv2d(hidden_dim * 2, hidden_dim, 1),
+            nn.Conv2d(hidden_dim * 2, out_dim, 1),
         )
         # Attention components (currently unused but available for future use)
         self.lin_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
@@ -328,10 +355,18 @@ class NeuralCellularAutomata2(nn.Module):
         return h_attn
 
     @jaxtyped(typechecker=beartype)
-    def forward(self, h: HiddenGrid, apply_noise: bool = True) -> HiddenGrid:
+    def forward(self, h: HiddenGrid, context: Optional[HiddenGrid] = None, apply_noise: bool = True) -> HiddenGrid:
         if apply_noise and self.self_healing_noise is not None:
             h = self.self_healing_noise(h)
-        x = h.permute(0, 3, 1, 2).contiguous()
+            
+        # Concatenate context if provided
+        if context is not None and self.context_dim is not None:
+            h_with_context = torch.cat([h, context], dim=-1)
+            h_proj = self.input_proj(h_with_context)
+        else:
+            h_proj = h
+            
+        x = h_proj.permute(0, 3, 1, 2).contiguous()
         perceived = self.perception_conv(x)
         dx = self.update_net(perceived)
         x_new = self.stochastic_update(x, dx)
@@ -432,8 +467,8 @@ class MainModel(pl.LightningModule):
     training_index_metrics: Dict[int, Dict[str, int]] = {}
     validation_index_metrics: Dict[int, Dict[str, int]] = {}
     force_visualize: bool = False
-    last_max_loss: float | None = None
-    last_logits_abs_mean: float | None = None
+    last_max_loss: Optional[float] = None
+    last_logits_abs_mean: Optional[float] = None
     frame_capture: FrameCapture = FrameCapture()
 
     def __init__(
@@ -481,7 +516,9 @@ class MainModel(pl.LightningModule):
 
         self.linear_1 = nn.Linear(hidden_dim, hidden_dim)
         self.nca = NeuralCellularAutomata2(
-            hidden_dim * 2,
+            hidden_dim=hidden_dim,
+            out_dim=hidden_dim,
+            context_dim=hidden_dim,  # Context is the original input features
             dropout=dropout,
             enable_self_healing=enable_self_healing,
             death_prob=death_prob,
@@ -489,10 +526,15 @@ class MainModel(pl.LightningModule):
             spatial_corruption_prob=spatial_corruption_prob,
             num_final_steps=num_final_steps,
         )
-        self.message_passing = SpatialMessagePassing(hidden_dim * 2, dropout=dropout)
+        self.message_passing = SpatialMessagePassing(
+            hidden_dim=hidden_dim, 
+            out_dim=hidden_dim, 
+            context_dim=hidden_dim,  # Context is the original input features
+            dropout=dropout
+        )
         self.drop = nn.Dropout(dropout)
         self.drop1 = nn.Dropout(dropout_h)
-        self.available_colors: list[int] | None = None
+        self.available_colors: Optional[List[int]] = None
         self.arsinh_norm2a = ArsinhNorm(hidden_dim)
         self.arsinh_norm2b = ArsinhNorm(hidden_dim)
         self.d4_embed = nn.Embedding(8, dim_d4_embed)
@@ -532,21 +574,27 @@ class MainModel(pl.LightningModule):
                 break
             if apply_noise:
                 h = self.drop1(h)
-            oh = torch.cat([o, h], dim=-1)
-            u = self.nca(oh, apply_noise=apply_noise)
+            # Pass original input 'o' as context instead of concatenating
+            u = self.nca(h, context=o, apply_noise=apply_noise)
             u = self.arsinh_norm2a(u)
             h = h + 0.1 * u
-            m = self.linear_1(self.message_passing(oh))
+            # Pass original input 'o' as context to message passing
+            m = self.linear_1(self.message_passing(h, context=o))
             if apply_noise:
                 m = self.drop(m)
             m = self.arsinh_norm2b(m)
             h = h + 0.1 * m
+            # Optional: Add small residual connection from input
+            h = h + 0.01 * o  # Helps preserve input information
             self.frame_capture.capture(self.linear_0(h), round_idx=t)  # Single line injection
         combined_logits = self.linear_0(h)
         
         # Logits explosion detection
         current_logits_abs_mean = float(combined_logits.abs().mean().item())
-        self.log(f"{step_type}_logits_abs_mean", current_logits_abs_mean)  # type: ignore
+        try:
+            self.log(f"{step_type}_logits_abs_mean", current_logits_abs_mean)  # type: ignore
+        except Exception:
+            pass  # Logging not available outside trainer
         self.last_logits_abs_mean = current_logits_abs_mean
         
         self.frame_capture.capture(combined_logits, round_idx=self.num_message_rounds)  # Capture final state
