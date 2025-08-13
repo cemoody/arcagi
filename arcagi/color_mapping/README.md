@@ -699,4 +699,42 @@ For proper train/test generalization:
   - Uses Order2 features as base representation
   - NCA2 processes features with self-healing noise for robustness
   - Attention-ready architecture allows for future enhancements
-  - Configurable message rounds and self-healing parameters 
+  - Configurable message rounds and self-healing parameters
+
+### ex36.py - Local Attention-Based Model with NATTEN
+- **Architecture Innovation**: Replaces NCA and message passing with pure local attention mechanism
+- **Key Changes from ex35**:
+  - **NATTEN Integration**: Uses Neighborhood Attention (NATTEN) for efficient local attention computation
+  - **LocalAttentionBlock**: Each block includes:
+    - Pre-normalization with ArsinhNorm
+    - Multi-head neighborhood attention (9 heads)
+    - Feed-forward network with GELU activation
+    - Residual connections throughout
+  - **LocalAttentionStack**: 4 layers with varying configurations:
+    - Kernel sizes: [3, 3, 5, 5]
+    - Dilations: [1, 2, 2, 4] for expanding receptive field
+    - Context integration at each layer
+- **Technical Considerations**:
+  - **Head Dimension Constraint**: NATTEN requires head_dim to be multiple of 8
+  - **Adjusted Architecture**: Uses 9 attention heads (instead of 8) to satisfy constraint
+    - hidden_dim = 72 (64 + 8 from D4 embedding)
+    - head_dim = 72 / 9 = 8 ✓
+  - **Fallback Implementation**: Includes grouped convolution fallback when NATTEN unavailable
+- **Key Features Retained**:
+  - Order2Features encoder for domain-specific feature extraction
+  - D4 embeddings for rotation/reflection invariance
+  - Self-healing noise for robustness
+  - Frame capture for visualization
+  - Adaptive gradient scaling
+- **Performance Notes**:
+  - Model has 183,371 parameters (0.2M)
+  - Successfully trains with NATTEN acceleration
+  - Local attention allows each cell to attend to its 8 neighboring cells
+  - Multiple rounds of attention updates similar to NCA/message passing
+- **Installation Requirements**:
+  - NATTEN library for optimal performance: `uv pip install natten==0.21.0+torch270cu126 -f https://whl.natten.org`
+  - Check PyTorch version compatibility before installing NATTEN
+- **Key Insights**:
+  - Local attention provides an alternative to convolution-based approaches
+  - Attention mechanisms can effectively capture spatial relationships in grid-based tasks
+  - NATTEN enables efficient implementation of neighborhood attention patterns 
