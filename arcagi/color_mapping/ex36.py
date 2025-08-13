@@ -956,7 +956,7 @@ def main(training_config: TrainingConfig):
             num_workers=0,  # Eliminate multiprocessing overhead for small datasets
             augment=True,
             deterministic_augmentation=training_config.d4_deterministic,
-            repeat_factor=1,
+            repeat_factor=5,
         )
     else:
         print("\nTraining without D4 augmentation")
