@@ -70,8 +70,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our visualization tools
 # Import data loading functions
-from data_loader import create_dataloader, prepare_dataset
-from d4_augmentation_dataset import create_d4_augmented_dataloader
+from data_loader import prepare_dataset
 from models import Batch, BatchData
 from utils.metrics import image_metrics
 from utils.terminal_imshow import imshow
@@ -223,7 +222,7 @@ class TrainingConfig(BaseModel):
     # Training parameters
     max_epochs: int = 2000
     lr: float = 0.005
-    weight_decay: float = 1e-9
+    weight_decay: float = 1e-7
     feature_dim: int = 64
     num_message_rounds: int = 48
     num_final_steps: int = 12
@@ -237,12 +236,8 @@ class TrainingConfig(BaseModel):
     dropout: float = 0.15
     dropout_h: float = 0.15
 
-    # Model parameters
-    filename: str = "3345333e"
-
     # Multi-file training parameters
-    experiment_type: str = "multi_file"  # "single_file" or "multi_file"
-    filenames: List[str] = ["28e73c20.json", "00d62c1b.json"]  # For multi_file mode
+    filenames: List[str] = ["28e73c20.json", "00d62c1b.json"]
 
     # Context-aware attention parameters
     context_dim: int = 32
@@ -1169,35 +1164,6 @@ class MainModel(pl.LightningModule):
             for filename, file_id in self.file_context_embedding.filename_to_id.items():
                 self.file_id_to_name[file_id] = filename
 
-        # Debug logging for multi-file training
-        if (
-            self.enable_file_context
-            and file_ids is not None
-            and batch_idx == 0
-            and self.current_epoch == 0
-        ):
-            print(f"\n[DEBUG] First batch of first epoch:")
-            print(f"  File IDs in batch: {file_ids.unique().tolist()}")
-            print(f"  Batch size: {len(file_ids)}")
-            print(
-                f"  File ID distribution: {[(fid.item(), (file_ids == fid).sum().item()) for fid in file_ids.unique()]}"
-            )
-
-            # Log gate values after forward pass
-            if self.enable_file_context and hasattr(
-                self.attention_stack.layers[0].attention, "qkv_modulation"
-            ):
-                with torch.no_grad():
-                    context = self.file_context_embedding(file_ids)
-                    alpha = self.attention_stack.layers[
-                        0
-                    ].attention.qkv_modulation.gate(context)
-                    print(
-                        f"  Alpha (gate) values: min={alpha.min().item():.4f}, max={alpha.max().item():.4f}, mean={alpha.mean().item():.4f}"
-                    )
-                    print(
-                        f"  Context embeddings norm: {context.norm(dim=-1).mean().item():.4f}"
-                    )
 
         # Make predictions
         transform_idx = (
@@ -1214,24 +1180,11 @@ class MainModel(pl.LightningModule):
         logits_perm = logits.permute(0, 3, 1, 2)  # [B, 11, 30, 30]
         loss = cross_entropy_shifted(logits_perm, i.out.col.long(), start_index=-1)
 
-        # Loss explosion detection
-        current_loss = float(loss.item())
-        if self.last_max_loss is not None and current_loss > self.last_max_loss:
-            print(f"\n!!! LOSS EXPLOSION DETECTED !!!")
-            print(f"Previous loss: {self.last_max_loss:.6f}")
-            print(f"Current loss: {current_loss:.6f}")
-            print(f"Ratio: {current_loss / self.last_max_loss:.2f}x")
-            print(f"Epoch: {self.current_epoch}, Batch: {batch_idx}")
-            print(
-                f"Logits stats: min={logits.min().item():.6f}, max={logits.max().item():.6f}, mean={logits.mean().item():.6f}"
-            )
-
-            self.last_max_loss = current_loss
-
         image_metrics(i.out, logits, metrics, prefix=step_type)
 
         # Visualize every 10 epochs
-        if self.force_visualize or (self.current_epoch % 10 == 0 and batch_idx == 0):
+        # For validation, visualize all batches, not just the first one
+        if self.force_visualize or (self.current_epoch % 10 == 0 and (batch_idx == 0 or step_type == "val")):
             self.visualize_predictions(
                 i,
                 i.out.col,
@@ -1243,8 +1196,8 @@ class MainModel(pl.LightningModule):
         int_metrics: Dict[tuple[str, int], Dict[str, int]] = {}
         for idx, m in metrics.items():
             # Determine filename for this index
+            # Multi-file mode - find the file ID for this example index
             if file_ids is not None and self.file_id_to_name:
-                # Find the file ID for this example index in the batch
                 batch_indices = i.out.idx
                 mask = batch_indices == idx
                 if mask.any():
@@ -1254,8 +1207,7 @@ class MainModel(pl.LightningModule):
                 else:
                     filename = "unknown"
             else:
-                # Single file mode - use the configured filename
-                filename = getattr(self, '_training_filename', 'single_file')
+                filename = "unknown"
             
             key = (filename, idx)
             int_metrics[key] = {k: int(v) for k, v in m.items()}
@@ -1458,35 +1410,48 @@ class MainModel(pl.LightningModule):
         start_index: int = -1,
     ) -> None:
         """Visualize predictions vs ground truth for training."""
-        # Only visualize the first example in the batch
-        b = 0  # First example only
-        pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
-        true_colors = targets[b].cpu()
+        # Get batch size
+        batch_size = targets.shape[0]
+        
+        # Visualize all examples in the batch
+        for b in range(batch_size):
+            pred_colors = predictions[b].argmax(dim=-1).cpu() + start_index
+            true_colors = targets[b].cpu()
+            
+            # Get example index and filename info
+            example_idx = i.out.idx[b].item()
+            
+            # Try to get filename if available
+            filename_info = ""
+            if hasattr(i.inp, 'file_ids') and i.inp.file_ids is not None and self.file_id_to_name:
+                file_id = i.inp.file_ids[b].item()
+                filename = self.file_id_to_name.get(file_id, f"file_{file_id}")
+                filename_info = f" - File: {filename}"
 
-        # Create visualization
-        print(f"\n{'='*60}")
-        print(f"{prefix.upper()} - Epoch {self.current_epoch}")
-        print(f"{'='*60}")
+            # Create visualization
+            print(f"\n{'='*60}")
+            print(f"{prefix.upper()} - Epoch {self.current_epoch} - Example {example_idx}{filename_info}")
+            print(f"{'='*60}")
 
-        # Show ground truth
-        print("\nGround Truth colors:")
-        imshow(true_colors, title=None, show_legend=True)
+            # Show ground truth
+            print("\nGround Truth colors:")
+            imshow(true_colors, title=None, show_legend=True)
 
-        # Show predictions
-        print("\nPredicted colors:")
-        correct = (true_colors == pred_colors) | (true_colors == -1)
-        imshow(pred_colors, title=None, show_legend=True, correct=correct)
+            # Show predictions
+            print("\nPredicted colors:")
+            correct = (true_colors == pred_colors) | (true_colors == -1)
+            imshow(pred_colors, title=None, show_legend=True, correct=correct)
 
-        # Calculate accuracy for this example
-        valid_mask = true_colors != -1
-        if valid_mask.any():
-            accuracy = (
-                (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
-            )
+            # Calculate accuracy for this example
+            valid_mask = true_colors != -1
+            if valid_mask.any():
+                accuracy = (
+                    (pred_colors[valid_mask] == true_colors[valid_mask]).float().mean()
+                )
 
-            # Also show mask predictions vs ground truth
-            print("\nMask predictions (True=active pixel, False=inactive):")
-            print(f"\nColor Accuracy: {accuracy:.2%}")
+                # Also show mask predictions vs ground truth
+                print("\nMask predictions (True=active pixel, False=inactive):")
+                print(f"\nColor Accuracy: {accuracy:.2%}")
 
 
 @click.command()
@@ -1500,27 +1465,10 @@ class MainModel(pl.LightningModule):
 )
 def main(training_config: TrainingConfig):
 
-    # Check experiment type
-    if training_config.experiment_type == "multi_file":
-        print("\n=== Multi-File Training with Context-Aware Attention ===")
-        print(f"Training on files: {', '.join(training_config.filenames)}")
-        print("Architecture: color -> order2 -> context-modulated attention -> color")
-
-        # For debugging, use tiny model sizes
-        # if len(training_config.filenames) == 2:  # Debug mode
-        #     print("\n*** DEBUG MODE: Using tiny model sizes ***")
-        #     training_config.feature_dim = 16
-        #     training_config.num_message_rounds = 2
-        #     training_config.max_epochs = 1
-        #     training_config.context_dim = 8
-        #     training_config.lora_rank = 4
-    else:
-        # Single file training
-        filename = training_config.filename
-        print("\n=== Order2-based Model with Local Attention ===")
-        print(f"Training on 'train' subset of {filename}")
-        print(f"Evaluating on 'test' subset of {filename}")
-        print("Architecture: color -> order2 -> local attention stack -> color")
+    # Multi-file training
+    print("\n=== Multi-File Training with Context-Aware Attention ===")
+    print(f"Training on files: {', '.join(training_config.filenames)}")
+    print("Architecture: color -> order2 -> context-modulated attention -> color")
     print(f"Using convolution-based local attention")
     print(
         f"D4 Augmentation: {'Enabled' if training_config.use_d4_augmentation else 'Disabled'}"
@@ -1560,183 +1508,67 @@ def main(training_config: TrainingConfig):
         grad_scaler_z_thresh=training_config.grad_scaler_z_thresh,
         context_dim=training_config.context_dim,
         lora_rank=training_config.lora_rank,
-        enable_file_context=(training_config.experiment_type == "multi_file"),
+        enable_file_context=True,
     )
 
-    # Store training filename for single-file mode
-    if training_config.experiment_type != "multi_file":
-        setattr(model, '_training_filename', training_config.filename)
 
-    if training_config.experiment_type == "multi_file":
-        # Multi-file training
-        print("\nLoading data from multiple files...")
 
-        # Create train loader
-        assert (
-            model.file_context_embedding is not None
-        ), "File context embedding should be initialized for multi-file mode"
-        train_loader = create_multi_file_dataloader(
-            filenames=training_config.filenames,
-            file_context_embedding=model.file_context_embedding,
-            training_config=training_config,
-            dataset_name="train",
-            batch_size=2,  # Very small batch size to avoid OOM with D4 augmentation
-            shuffle=True,
-        )
+    # Multi-file training
+    print("\nLoading data from multiple files...")
 
-        # Create validation loader
-        val_loader = create_multi_file_dataloader(
-            filenames=training_config.filenames,
-            file_context_embedding=model.file_context_embedding,
-            training_config=training_config,
-            dataset_name="test",
-            batch_size=1,  # Process one example at a time for validation
-            shuffle=False,
-        )
+    # Create train loader
+    assert (
+        model.file_context_embedding is not None
+    ), "File context embedding should be initialized for multi-file mode"
+    train_loader = create_multi_file_dataloader(
+        filenames=training_config.filenames,
+        file_context_embedding=model.file_context_embedding,
+        training_config=training_config,
+        dataset_name="train",
+        batch_size=2,  # Very small batch size to avoid OOM with D4 augmentation
+        shuffle=True,
+    )
 
-        test_loader = val_loader  # Same as validation for multi-file
+    # Create validation loader
+    val_loader = create_multi_file_dataloader(
+        filenames=training_config.filenames,
+        file_context_embedding=model.file_context_embedding,
+        training_config=training_config,
+        dataset_name="test",
+        batch_size=1,  # Process one example at a time for validation
+        shuffle=False,
+    )
 
-        # Get all colors for constraint setting
-        all_colors = []
-        for filename in training_config.filenames:
-            (
-                inputs,
-                outputs,
-                _,
-                _,
-                _,
-            ) = prepare_dataset(
-                "processed_data/train_all.npz",
-                filter_filename=filename,
-                use_features=False,
-                dataset_name="train",
-                use_train_subset=True,
-            )
-            input_colors = inputs.argmax(dim=-1)
-            output_colors = outputs.argmax(dim=-1)
-            input_colors = torch.where(input_colors == 10, -1, input_colors)
-            output_colors = torch.where(output_colors == 10, -1, output_colors)
-            all_colors.extend([input_colors.flatten(), output_colors.flatten()])
+    test_loader = val_loader  # Same as validation for multi-file
 
-        all_colors = torch.cat(all_colors)
-
-    else:
-        # Single file training (original code)
-        filename = training_config.filename
-
-        # Load train subset using data_loader.py
+    # Get all colors for constraint setting
+    all_colors = []
+    for filename in training_config.filenames:
         (
-            train_inputs,
-            train_outputs,
-            train_input_features,
-            train_output_features,
-            train_indices,
+            inputs,
+            outputs,
+            _,
+            _,
+            _,
         ) = prepare_dataset(
             "processed_data/train_all.npz",
-            filter_filename=f"{filename}.json",
-            use_features=True,
+            filter_filename=filename,
+            use_features=False,
             dataset_name="train",
             use_train_subset=True,
         )
+        input_colors = inputs.argmax(dim=-1)
+        output_colors = outputs.argmax(dim=-1)
+        input_colors = torch.where(input_colors == 10, -1, input_colors)
+        output_colors = torch.where(output_colors == 10, -1, output_colors)
+        all_colors.extend([input_colors.flatten(), output_colors.flatten()])
 
-        # Load test subset using data_loader.py
-        (
-            test_inputs,
-            test_outputs,
-            test_input_features,
-            test_output_features,
-            test_indices,
-        ) = prepare_dataset(
-            "processed_data/train_all.npz",
-            filter_filename=f"{filename}.json",
-            use_features=True,
-            dataset_name="test",
-            use_train_subset=False,
-        )
-
-        # Get available colors from training data
-        # Convert one-hot encoded tensors back to color indices
-        train_input_colors = train_inputs.argmax(dim=-1)  # [B, 30, 30]
-        train_output_colors = train_outputs.argmax(dim=-1)  # [B, 30, 30]
-
-        # Handle mask: if max value is at index 10, it means masked (-1)
-        train_input_colors = torch.where(
-            train_input_colors == 10, -1, train_input_colors
-        )
-        train_output_colors = torch.where(
-            train_output_colors == 10, -1, train_output_colors
-        )
-
-        all_colors = torch.cat(
-            [train_input_colors.flatten(), train_output_colors.flatten()]
-        )
-
-        # Create dataloaders - use D4 augmentation for training if enabled
-        if training_config.use_d4_augmentation:
-            print(
-                f"\nUsing D4 augmentation for training (deterministic={training_config.d4_deterministic})"
-            )
-            train_loader = create_d4_augmented_dataloader(
-                train_inputs,
-                train_outputs,
-                inputs_features=train_input_features,
-                outputs_features=train_output_features,
-                indices=train_indices,
-                batch_size=len(train_inputs)
-                * (
-                    8 if training_config.d4_deterministic else 1
-                ),  # All transforms in one batch if deterministic
-                shuffle=True,
-                num_workers=0,  # Eliminate multiprocessing overhead for small datasets
-                augment=True,
-                deterministic_augmentation=training_config.d4_deterministic,
-                repeat_factor=1,
-            )
-        else:
-            print("\nTraining without D4 augmentation")
-            train_loader = create_dataloader(
-                train_inputs,
-                train_outputs,
-                batch_size=len(train_inputs),
-                shuffle=True,
-                num_workers=0,  # Eliminate multiprocessing overhead for small datasets
-                inputs_features=train_input_features,
-                outputs_features=train_output_features,
-                indices=train_indices,
-                repeat_factor=10,
-            )
-
-        # Validation and test loaders don't use augmentation
-        val_loader = create_d4_augmented_dataloader(
-            test_inputs,
-            test_outputs,
-            inputs_features=test_input_features,
-            outputs_features=test_output_features,
-            indices=test_indices,
-            batch_size=len(test_inputs),  # No augmentation for validation/test
-            shuffle=False,
-            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
-            augment=False,  # No augmentation for validation
-        )
-        test_loader = create_d4_augmented_dataloader(
-            test_inputs,
-            test_outputs,
-            inputs_features=test_input_features,
-            outputs_features=test_output_features,
-            indices=test_indices,
-            batch_size=len(test_inputs),  # No augmentation for validation/test
-            shuffle=False,
-            num_workers=0,  # Eliminate multiprocessing overhead for small datasets
-            augment=False,  # No augmentation for test
-        )
+    all_colors = torch.cat(all_colors)
 
     # Compute available colors from training data and set constraints
     all_colors_non_mask: torch.Tensor = all_colors[all_colors != -1]
     available_colors: torch.Tensor = torch.unique(all_colors_non_mask)  # type: ignore[call-arg]
-    if training_config.experiment_type == "multi_file":
-        print(f"Available colors across all files: {available_colors}")
-    else:
-        print(f"Available colors for {training_config.filename}: {available_colors}")
+    print(f"Available colors across all files: {available_colors}")
     model.available_colors = available_colors.tolist()  # type: ignore[no-untyped-call]
 
     # Print model info
@@ -1762,10 +1594,7 @@ def main(training_config: TrainingConfig):
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 
         # Create run name with config hash
-        if training_config.experiment_type == "multi_file":
-            run_name = f"ex37-multifile-{config_hash}"
-        else:
-            run_name = f"ex36-{training_config.filename}-{config_hash}"
+        run_name = f"ex37-multifile-{config_hash}"
 
         # Initialize wandb logger with all config parameters
         wandb_logger = WandbLogger(
@@ -1809,15 +1638,9 @@ def main(training_config: TrainingConfig):
             model.validation_step(batch, batch_idx)
 
     # Save the final trained model with filename-specific name
-    if training_config.experiment_type == "multi_file":
-        final_model_path = os.path.join(
-            training_config.checkpoint_dir, f"order2_model_multifile.pt"
-        )
-    else:
-        final_model_path = os.path.join(
-            training_config.checkpoint_dir,
-            f"order2_model_{training_config.filename}.pt",
-        )
+    final_model_path = os.path.join(
+        training_config.checkpoint_dir, f"order2_model_multifile.pt"
+    )
 
     # Save both model state dict and metadata
     # Save both model state dict and minimal metadata (avoid typing complaints)
@@ -1827,11 +1650,7 @@ def main(training_config: TrainingConfig):
         hyperparams = {}
     model_save_data: Dict[str, Any] = {
         "model_state_dict": model.state_dict(),
-        "filename": (
-            training_config.filename
-            if training_config.experiment_type != "multi_file"
-            else "multi_file"
-        ),
+        "filename": "multi_file",
         "hyperparameters": hyperparams,
     }
 
