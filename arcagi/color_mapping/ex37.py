@@ -2,9 +2,11 @@ import hashlib
 import json
 import os
 import random
+import numpy as np
 
 # Import from parent module
 import sys
+from collections import defaultdict
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -63,8 +65,10 @@ NCALatent: TypeAlias = "torch.Tensor"  # [B, D, 30, 30] float
 D4TransformType: TypeAlias = "torch.Tensor"  # [B, 30, 30] int
 try:
     from pytorch_lightning.loggers import WandbLogger  # type: ignore
+    import wandb
 except Exception:
     WandbLogger = None  # type: ignore
+    wandb = None  # type: ignore
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1329,6 +1333,9 @@ class MainModel(pl.LightningModule):
         self.log("val_input_mask_acc", float(val_input_mask_acc))  # type: ignore
         self.log("val_output_mask_acc", float(val_output_mask_acc))  # type: ignore
 
+        # Log detailed per-example metrics to wandb
+        self._log_wandb_validation_metrics()
+
     def epoch_end(self, step_type: Literal["train", "val"]) -> None:
         if step_type == "train":
             metrics = self.training_index_metrics
@@ -1367,6 +1374,123 @@ class MainModel(pl.LightningModule):
             self.training_index_metrics = {}
         else:
             self.validation_index_metrics = {}
+
+    def _log_wandb_validation_metrics(self) -> None:
+        """Log detailed per-example validation metrics to wandb."""
+        if wandb is None or not hasattr(wandb, 'run') or not wandb.run:
+            return
+            
+        if not self.validation_index_metrics:
+            return
+
+        # 1. Create wandb table for detailed per-example metrics
+        table_columns = [
+            "epoch", "filename", "index", 
+            "incorrect_pixels", "incorrect_mask", 
+            "total_pixels", "pixel_accuracy", "all_perfect"
+        ]
+        wandb_table = wandb.Table(columns=table_columns)
+        
+        # Sort by filename first, then by index for consistent ordering
+        sorted_keys = sorted(self.validation_index_metrics.keys(), key=lambda x: (x[0], x[1]))
+        
+        for (filename, idx), metrics in self.validation_index_metrics.items():
+            incorrect_pixels = metrics["val_n_incorrect_num_color"]
+            incorrect_mask = metrics["val_n_incorrect_num_mask"]
+            total_pixels = 900  # 30x30 grid
+            pixel_accuracy = 1 - (incorrect_pixels / total_pixels)
+            all_perfect = incorrect_pixels == 0
+            
+            wandb_table.add_data(
+                self.current_epoch,
+                filename,
+                idx,
+                incorrect_pixels,
+                incorrect_mask,
+                total_pixels,
+                pixel_accuracy,
+                all_perfect
+            )
+            
+            # 2. Log time-series metrics for each example
+            metric_prefix = f"val_example/{filename}_{idx}"
+            self.log(f"{metric_prefix}/incorrect_pixels", incorrect_pixels)
+            self.log(f"{metric_prefix}/incorrect_mask", incorrect_mask)
+            self.log(f"{metric_prefix}/pixel_accuracy", pixel_accuracy)
+            self.log(f"{metric_prefix}/all_perfect", float(all_perfect))
+        
+        # Log the table
+        wandb.log({"val_per_example_metrics": wandb_table})
+        
+        # 3. Aggregate metrics by filename
+        file_metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: {
+            "incorrect_pixels": 0.0, 
+            "incorrect_mask": 0.0, 
+            "count": 0,
+            "perfect_count": 0
+        })
+        
+        for (filename, idx), metrics in self.validation_index_metrics.items():
+            file_metrics[filename]["incorrect_pixels"] += metrics["val_n_incorrect_num_color"]
+            file_metrics[filename]["incorrect_mask"] += metrics["val_n_incorrect_num_mask"]
+            file_metrics[filename]["count"] += 1
+            if metrics["val_n_incorrect_num_color"] == 0:
+                file_metrics[filename]["perfect_count"] += 1
+        
+        # Log per-file averages
+        for filename, agg_metrics in file_metrics.items():
+            count = agg_metrics["count"]
+            avg_incorrect = agg_metrics["incorrect_pixels"] / count
+            avg_mask_incorrect = agg_metrics["incorrect_mask"] / count
+            solve_rate = agg_metrics["perfect_count"] / count
+            
+            self.log(f"val_file/{filename}/avg_incorrect_pixels", avg_incorrect)
+            self.log(f"val_file/{filename}/avg_incorrect_mask", avg_mask_incorrect)
+            self.log(f"val_file/{filename}/solve_rate", solve_rate)
+        
+        # 4. Create heatmap visualization
+        files = sorted(set(f for f, _ in self.validation_index_metrics.keys()))
+        indices = sorted(set(i for _, i in self.validation_index_metrics.keys()))
+        
+        if len(files) > 0 and len(indices) > 0:
+            heatmap_data = np.zeros((len(files), len(indices)))
+            
+            for i, file in enumerate(files):
+                for j, idx in enumerate(indices):
+                    if (file, idx) in self.validation_index_metrics:
+                        heatmap_data[i, j] = self.validation_index_metrics[(file, idx)]["val_n_incorrect_num_color"]
+                    else:
+                        heatmap_data[i, j] = np.nan  # Mark missing data
+            
+            # Create custom chart for heatmap
+            wandb.log({
+                "val_performance_heatmap": wandb.plots.HeatMap(
+                    x_labels=[str(idx) for idx in indices],
+                    y_labels=files,
+                    matrix_values=heatmap_data.tolist(),
+                    show_text=True
+                )
+            })
+        
+        # 5. Track overall progress metrics
+        solved_examples = sum(
+            1 for metrics in self.validation_index_metrics.values() 
+            if metrics["val_n_incorrect_num_color"] == 0
+        )
+        total_examples = len(self.validation_index_metrics)
+        
+        self.log("val_examples_solved", solved_examples)
+        self.log("val_solve_rate", solved_examples / total_examples if total_examples > 0 else 0)
+        
+        # Log histogram of incorrect pixels
+        incorrect_pixels_list = [
+            metrics["val_n_incorrect_num_color"] 
+            for metrics in self.validation_index_metrics.values()
+        ]
+        if incorrect_pixels_list:
+            wandb.log({
+                "val_incorrect_pixels_histogram": wandb.Histogram(incorrect_pixels_list)
+            })
 
     def configure_optimizers(self):  # type: ignore[override]
         # Use AdamW optimizer
