@@ -442,48 +442,18 @@ class LocalAttentionBlock(nn.Module):
         self.norm1 = ArsinhNorm(hidden_dim)
 
         # Use context-modulated attention if file context is provided
-        if file_context_dim is not None:
-            self.attention = ContextModulatedNeighborhoodAttention(
-                embed_dim=hidden_dim,
-                num_heads=num_heads,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                context_dim=file_context_dim,
-                lora_rank=lora_rank,
-                qkv_bias=True,
-                qk_scale=None,
-                proj_drop=dropout,
-            )
-            self.use_context_modulation = True
-        elif NATTEN_AVAILABLE:
-            # Use standard NATTEN without context modulation
-            self.attention = NeighborhoodAttention2D(
-                embed_dim=hidden_dim,
-                num_heads=num_heads,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                qkv_bias=True,
-                qk_scale=None,
-                proj_drop=dropout,
-            )
-            self.use_context_modulation = False
-        else:
-            # Fallback to a simple local convolution if NATTEN not available
-            print("Using fallback convolution instead of NATTEN")
-            self.attention = nn.Sequential(
-                nn.Conv2d(
-                    hidden_dim,
-                    hidden_dim,
-                    kernel_size=kernel_size,
-                    padding=kernel_size // 2,
-                    groups=1,  # Use single group for compatibility with small hidden_dim
-                ),
-                nn.GELU(),
-                nn.Conv2d(hidden_dim, hidden_dim, 1),
-            )
-            self.use_conv_fallback = True
-            self.use_context_modulation = False
-
+        self.attention = ContextModulatedNeighborhoodAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            context_dim=file_context_dim,
+            lora_rank=lora_rank,
+            qkv_bias=True,
+            qk_scale=None,
+            proj_drop=dropout,
+        )
+        self.use_context_modulation = True
         # Post-attention normalization and feed-forward
         self.norm2 = ArsinhNorm(hidden_dim)
         self.mlp = nn.Sequential(
@@ -1612,6 +1582,9 @@ class MainModel(pl.LightningModule):
     },
 )
 def main(training_config: TrainingConfig):
+    # Enable anomaly detection for debugging gradient issues
+    torch.autograd.set_detect_anomaly(True)
+    print("⚠️  Anomaly detection enabled - training will be slower but will pinpoint NaN/Inf sources")
 
     # Multi-file training
     print("\n=== Multi-File Training with Context-Aware Attention ===")
