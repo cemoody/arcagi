@@ -237,8 +237,8 @@ class TrainingConfig(BaseModel):
     death_prob: float = 0.30
     gaussian_std: float = 0.30
     spatial_corruption_prob: float = 0.30
-    dropout: float = 0.15
-    dropout_h: float = 0.15
+    dropout: float = 0.30
+    dropout_h: float = 0.30
 
     # Multi-file training parameters
     filenames: List[str] = ["28e73c20.json", "00d62c1b.json"]
@@ -1135,14 +1135,38 @@ class MainModel(pl.LightningModule):
     def validation_step(
         self, batch: List[torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        self.frame_capture.clear()
-        self.frame_capture.enable()
+        # Only enable frame capture every 10th step
+        if batch_idx % 10 == 0:
+            self.frame_capture.clear()
+            self.frame_capture.enable()
+        
         out = self.step(batch, batch_idx, step_type="val")
-        self.frame_capture.disable()
-        self.frame_capture.to_gif(
-            f"gifs/message_rounds_{self.current_epoch}.gif", duration_ms=100
-        )
-        logger.info(f"Animation saved to message_rounds_{self.current_epoch}.gif")
+        
+        # Only save GIF every 10th step
+        if batch_idx % 10 == 0:
+            self.frame_capture.disable()
+            
+            # Get batch information for filename
+            i = batch_to_dataclass(batch)
+            file_ids = getattr(i.inp, "file_ids", None)
+            
+            # Determine filename and index for the first item in batch
+            filename = "unknown"
+            example_idx = 0
+            
+            if i.out.idx is not None and len(i.out.idx) > 0:
+                example_idx = i.out.idx[0].item()
+            
+            if file_ids is not None and self.file_id_to_name and len(file_ids) > 0:
+                file_id = file_ids[0].item()
+                filename = self.file_id_to_name.get(file_id, f"file_{file_id}")
+                # Remove file extension and path for cleaner filename
+                filename = filename.split('/')[-1].split('.')[0]
+            
+            gif_filename = f"gifs/message_rounds_{filename}_{example_idx}_{self.current_epoch}.gif"
+            self.frame_capture.to_gif(gif_filename, duration_ms=100)
+            logger.info(f"Animation saved to {gif_filename}")
+        
         return out
 
     @jaxtyped(typechecker=beartype)
