@@ -7,6 +7,7 @@ import torch
 
 from arcagi.data_loader import (
     create_dataloader,
+    create_shot_dataloader,
     filter_by_filename,
     filter_by_subset,
     load_feature_mapping_dataloader,
@@ -780,3 +781,288 @@ def test_end_to_end_indices_integration(npz_files, test_data):
         # Should only have one batch due to batch_size=2 and 2 examples
         assert batch_idx == 0
         break
+
+
+def test_create_shot_dataloader_basic(npz_files):
+    """Test basic few-shot dataloader functionality."""
+    dataloader = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=2,
+        shuffle=False,
+    )
+    
+    # Test that we can iterate through the dataloader
+    batches = list(dataloader)
+    
+    # The test data has 3 examples: file1.json (2 examples), file2.json (1 example)
+    # file2.json will be skipped because it has no context
+    # So we should have 2 examples from file1.json
+    assert len(batches) == 1  # 2 examples, batch_size=2 -> 1 batch
+    
+    # Check batch structure
+    batch = batches[0]
+    assert len(batch) == 5  # filenames, example_indices, inputs, outputs, context
+    filenames, example_indices, inputs, outputs, context = batch
+    
+    # Check shapes
+    assert len(filenames) == 2  # Batch of 2
+    assert example_indices.shape == (2,)
+    assert inputs.shape == (2, 30, 30, 11)
+    assert outputs.shape == (2, 30, 30, 11)
+    assert context.shape == (2, 1, 2, 30, 30, 11)  # Each has 1 context example
+    
+    # Check data types
+    assert isinstance(filenames[0], str)
+    assert example_indices.dtype == torch.long
+    assert inputs.dtype == torch.float32
+    assert outputs.dtype == torch.float32
+    assert context.dtype == torch.float32
+    
+    # Check filenames are correct
+    assert all(fname == "file1.json" for fname in filenames)
+    
+    # Check example indices
+    assert sorted(example_indices.tolist()) == [0, 1]
+
+
+def test_create_shot_dataloader_filename_filter(npz_files):
+    """Test few-shot dataloader with filename filtering."""
+    # Filter by "file1" (should get 2 examples)
+    dataloader = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=10,  # Large batch to get all examples
+        shuffle=False,
+        filename_filter="file1",
+    )
+    
+    batches = list(dataloader)
+    assert len(batches) == 1  # All examples should fit in one batch
+    
+    batch = batches[0]
+    filenames, example_indices, inputs, outputs, context = batch
+    
+    # Should have 2 examples (both from file1.json)
+    assert len(filenames) == 2
+    assert all(fname == "file1.json" for fname in filenames)
+    assert sorted(example_indices.tolist()) == [0, 1]
+    
+    # Each should have 1 context example (the other example from same file)
+    assert context.shape == (2, 1, 2, 30, 30, 11)
+
+
+def test_create_shot_dataloader_no_context(npz_files):
+    """Test few-shot dataloader with task that has no context."""
+    # Filter by "file2" (has only 1 example, so no context)
+    dataloader = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=10,
+        shuffle=False,
+        filename_filter="file2",
+    )
+    
+    batches = list(dataloader)
+    # Should return empty dataloader since file2 has only 1 example (no context)
+    assert len(batches) == 0
+
+
+def test_create_shot_dataloader_subset_filtering(npz_files):
+    """Test few-shot dataloader with subset filtering for context."""
+    # Test excluding train examples from context
+    dataloader_no_train = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=10,
+        shuffle=False,
+        context_includes_train=False,
+        context_includes_test=True,
+    )
+    
+    batches = list(dataloader_no_train)
+    # With the test data: file1.json has examples at indices 0 (train) and 2 (train)
+    # file2.json has example at index 1 (test)
+    # When excluding train from context, file1.json examples will have no context
+    assert len(batches) == 0  # No valid examples with context
+    
+    # Test excluding test examples from context
+    dataloader_no_test = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=10,
+        shuffle=False,
+        context_includes_train=True,
+        context_includes_test=False,
+    )
+    
+    batches = list(dataloader_no_test)
+    # file1.json has 2 train examples, so they can serve as context for each other
+    assert len(batches) == 1
+    
+    batch = batches[0]
+    filenames, example_indices, inputs, outputs, context = batch
+    
+    # Should have 2 examples from file1.json
+    assert len(filenames) == 2
+    assert all(fname == "file1.json" for fname in filenames)
+
+
+def test_create_shot_dataloader_empty_filter(npz_files):
+    """Test few-shot dataloader with filter that matches no examples."""
+    dataloader = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=2,
+        shuffle=False,
+        filename_filter="nonexistent_file",
+    )
+    
+    # Should return empty dataloader
+    batches = list(dataloader)
+    assert len(batches) == 0
+
+
+def test_create_shot_dataloader_context_ordering(npz_files):
+    """Test that context examples are ordered consistently by example index."""
+    dataloader = create_shot_dataloader(
+        str(npz_files["npz_feature_mapping_path"]),
+        batch_size=1,
+        shuffle=False,
+        filename_filter="file1",
+    )
+    
+    batches = list(dataloader)
+    assert len(batches) == 2  # 2 examples from file1.json, batch_size=1
+    
+    # Check that context is consistent across batches
+    for batch_idx, batch in enumerate(batches):
+        filenames, example_indices, inputs, outputs, context = batch
+        
+        assert len(filenames) == 1
+        assert filenames[0] == "file1.json"
+        
+        # Context should have shape [1, 1, 2, 30, 30, 11] (1 batch, 1 context example)
+        assert context.shape == (1, 1, 2, 30, 30, 11)
+
+
+@pytest.fixture
+def npz_files_extended(temp_dir):
+    """Create test NPZ files with more complex data for few-shot testing."""
+    npz_path = Path(temp_dir) / "test_fewshot_data.npz"
+    
+    # Create data with multiple tasks and examples
+    # Task 1 (file1.json): 4 examples
+    # Task 2 (file2.json): 3 examples  
+    # Task 3 (file3.json): 1 example (will be filtered out due to no context)
+    
+    n_examples = 8
+    expanded_inputs = np.full((n_examples, 30, 30), -1, dtype=np.int32)
+    expanded_outputs = np.full((n_examples, 30, 30), -1, dtype=np.int32)
+    
+    # Fill with different patterns for each example
+    for i in range(n_examples):
+        expanded_inputs[i, 14:16, 14:16] = i % 10
+        expanded_outputs[i, 14:16, 14:16] = (i + 1) % 10
+    
+    filenames = [
+        "file1.json", "file1.json", "file1.json", "file1.json",  # 4 examples
+        "file2.json", "file2.json", "file2.json",  # 3 examples
+        "file3.json",  # 1 example
+    ]
+    indices = [0, 1, 2, 3, 0, 1, 2, 0]  # Example indices within each file
+    
+    # Create subset information (mix of train/test)
+    subset_is_train = np.array([True, True, False, True, False, True, True, True], dtype=bool)
+    
+    # Save NPZ file
+    np.savez(
+        str(npz_path),
+        inputs=expanded_inputs,
+        outputs=expanded_outputs,
+        filenames=np.array(filenames),
+        indices=np.array(indices),
+        subset_example_index_is_train=subset_is_train,
+    )
+    
+    return {"npz_path": npz_path}
+
+
+def test_create_shot_dataloader_multiple_tasks(npz_files_extended):
+    """Test few-shot dataloader with multiple tasks of varying sizes."""
+    dataloader = create_shot_dataloader(
+        str(npz_files_extended["npz_path"]),
+        batch_size=4,
+        shuffle=False,
+    )
+    
+    # Collect all batches
+    all_filenames = []
+    all_example_indices = []
+    all_context_sizes = []
+    
+    for batch in dataloader:
+        filenames, example_indices, inputs, outputs, context = batch
+        all_filenames.extend(filenames)
+        all_example_indices.extend(example_indices.tolist())
+        
+        # Check context sizes
+        for i in range(len(filenames)):
+            # Count non-zero context examples (padding has all zeros)
+            non_zero_context = 0
+            for j in range(context.shape[1]):
+                if context[i, j].abs().sum() > 0:
+                    non_zero_context += 1
+            all_context_sizes.append(non_zero_context)
+    
+    # Should have 7 total examples (8 - 1 from file3.json which has no context)
+    assert len(all_filenames) == 7
+    
+    # Check file1.json examples
+    file1_count = sum(1 for f in all_filenames if f == "file1.json")
+    assert file1_count == 4  # All 4 examples from file1
+    
+    # Check file2.json examples  
+    file2_count = sum(1 for f in all_filenames if f == "file2.json")
+    assert file2_count == 3  # All 3 examples from file2
+    
+    # Check file3.json examples
+    file3_count = sum(1 for f in all_filenames if f == "file3.json")
+    assert file3_count == 0  # No examples (filtered out due to no context)
+    
+    # Check context sizes
+    # file1.json examples should have 3 context examples each
+    # file2.json examples should have 2 context examples each
+    for i, (fname, ctx_size) in enumerate(zip(all_filenames, all_context_sizes)):
+        if fname == "file1.json":
+            assert ctx_size == 3, f"file1.json example {i} should have 3 context examples"
+        elif fname == "file2.json":
+            assert ctx_size == 2, f"file2.json example {i} should have 2 context examples"
+
+
+def test_create_shot_dataloader_batch_consistency(npz_files_extended):
+    """Test that batches maintain consistency with shuffling."""
+    # Test that shuffle=False gives consistent results
+    dataloader1 = create_shot_dataloader(
+        str(npz_files_extended["npz_path"]),
+        batch_size=3,
+        shuffle=False,
+    )
+    
+    dataloader2 = create_shot_dataloader(
+        str(npz_files_extended["npz_path"]),
+        batch_size=3,
+        shuffle=False,
+    )
+    
+    # Collect batches from both
+    batches1 = list(dataloader1)
+    batches2 = list(dataloader2)
+    
+    # Should have same number of batches
+    assert len(batches1) == len(batches2)
+    
+    # Check that corresponding batches are identical
+    for b1, b2 in zip(batches1, batches2):
+        filenames1, indices1, inputs1, outputs1, context1 = b1
+        filenames2, indices2, inputs2, outputs2, context2 = b2
+        
+        assert filenames1 == filenames2
+        assert torch.equal(indices1, indices2)
+        assert torch.equal(inputs1, inputs2)
+        assert torch.equal(outputs1, outputs2)
+        assert torch.equal(context1, context2)
