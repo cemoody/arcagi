@@ -732,14 +732,15 @@ def create_shot_dataloader(
     filename_filter: Optional[str] = None,
     context_includes_train: bool = True,
     context_includes_test: bool = True,
+    subset: Optional[str] = None,
 ) -> DataLoader[Any]:
     """
     Create a DataLoader for few-shot learning tasks.
-    
+
     Each batch item contains:
     - A single example (input/output pair) from a task
     - Context: other examples from the same task (filename)
-    
+
     Args:
         npz_path: Path to NPZ file containing the data
         batch_size: Number of shots per batch
@@ -747,7 +748,8 @@ def create_shot_dataloader(
         filename_filter: Optional filter to specific filename (without .json extension)
         context_includes_train: Include examples from 'train' subset in context
         context_includes_test: Include examples from 'test' subset in context
-    
+        subset: Optional filter - 'train' or 'test' to include only that subset as main batch examples (context still follows context_includes_* settings)
+
     Returns:
         DataLoader with batches containing:
         - filenames: shape [B] - task filenames
@@ -757,7 +759,7 @@ def create_shot_dataloader(
         - context: shape [B, n_examples-1, 2, 30, 30, 11] - context examples (input/output pairs)
     """
     print(f"Loading few-shot data from {npz_path}")
-    
+
     # Load all data
     (
         filenames,
@@ -771,28 +773,42 @@ def create_shot_dataloader(
         _,  # outputs_mask (not needed)
         _,  # indices_tensor (not needed)
     ) = load_npz_data(npz_path, use_features=False, load_masks_and_indices=False)
-    
+
     # Apply filename filter if specified
     if filename_filter is not None:
         filename_with_ext = f"{filename_filter}.json"
         mask = [fname == filename_with_ext for fname in filenames]
         filter_indices = [i for i, m in enumerate(mask) if m]
-        
+
         if not filter_indices:
             print(f"Warning: No examples found for filename: {filename_filter}")
             # Return empty dataloader with custom collate function
             empty_tensors = [
-                torch.empty(0, dtype=torch.long),     # filename indices (placeholder)
-                torch.empty(0, dtype=torch.long),     # example_indices
-                torch.empty(0, 30, 30, 11),          # input_images
-                torch.empty(0, 30, 30, 11),          # output_images
-                torch.empty(0, 0, 2, 30, 30, 11),    # context
+                torch.empty(0, dtype=torch.long),  # filename indices (placeholder)
+                torch.empty(0, dtype=torch.long),  # example_indices
+                torch.empty(0, 30, 30, 11),  # input_images
+                torch.empty(0, 30, 30, 11),  # output_images
+                torch.empty(0, 0, 2, 30, 30, 11),  # context
             ]
             empty_dataset = TensorDataset(*empty_tensors)
-            def empty_collate(x: List[Any]) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                return ([], torch.empty(0, dtype=torch.long), torch.empty(0, 30, 30, 11), torch.empty(0, 30, 30, 11), torch.empty(0, 0, 2, 30, 30, 11))
-            return DataLoader(empty_dataset, batch_size=batch_size, collate_fn=empty_collate)
-        
+
+            def empty_collate(
+                x: List[Any],
+            ) -> Tuple[
+                List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+            ]:
+                return (
+                    [],
+                    torch.empty(0, dtype=torch.long),
+                    torch.empty(0, 30, 30, 11),
+                    torch.empty(0, 30, 30, 11),
+                    torch.empty(0, 0, 2, 30, 30, 11),
+                )
+
+            return DataLoader(
+                empty_dataset, batch_size=batch_size, collate_fn=empty_collate
+            )
+
         # Filter all arrays
         filenames = [filenames[i] for i in filter_indices]
         indices = [indices[i] for i in filter_indices]
@@ -800,103 +816,138 @@ def create_shot_dataloader(
         outputs = outputs[filter_indices]
         if subset_is_train is not None:
             subset_is_train = subset_is_train[filter_indices]
-        
+
         print(f"Filtered to filename: {filename_filter}")
         print(f"Found {len(filter_indices)} examples")
-    
+
+    # Print subset filtering info
+    if subset is not None:
+        print(
+            f"Subset filtering enabled: will only include '{subset}' examples as batch items"
+        )
+
     # Group examples by filename
     filename_to_examples: Dict[str, List[Dict[str, Any]]] = {}
     for i, (fname, idx) in enumerate(zip(filenames, indices)):
         if fname not in filename_to_examples:
             filename_to_examples[fname] = []
-        filename_to_examples[fname].append({
-            'global_idx': i,
-            'example_idx': idx,
-            'is_train': subset_is_train[i] if subset_is_train is not None else True
-        })
-    
+        filename_to_examples[fname].append(
+            {
+                "global_idx": i,
+                "example_idx": idx,
+                "is_train": subset_is_train[i] if subset_is_train is not None else True,
+            }
+        )
+
     # Prepare data for the dataset
     all_filenames: List[str] = []
     all_example_indices: List[int] = []
     all_input_images: List[torch.Tensor] = []
     all_output_images: List[torch.Tensor] = []
     all_contexts: List[torch.Tensor] = []
-    
+
     for global_idx, (fname, example_idx) in enumerate(zip(filenames, indices)):
+        # Apply subset filtering for main examples
+        if subset is not None and subset_is_train is not None:
+            if subset not in ["train", "test"]:
+                raise ValueError(f"subset must be 'train' or 'test', got: {subset}")
+
+            is_train = subset_is_train[global_idx]
+            if subset == "train" and not is_train:
+                continue  # Skip test examples when subset='train'
+            elif subset == "test" and is_train:
+                continue  # Skip train examples when subset='test'
+
         # Get all examples for this filename
         task_examples = filename_to_examples[fname]
-        
+
         # Filter context examples based on subset settings
         context_examples: List[Dict[str, Any]] = []
         for ex in task_examples:
             # Skip the current example
-            if ex['global_idx'] == global_idx:
+            if ex["global_idx"] == global_idx:
                 continue
-            
+
             # Check subset filtering
             if subset_is_train is not None:
-                if ex['is_train'] and not context_includes_train:
+                if ex["is_train"] and not context_includes_train:
                     continue
-                if not ex['is_train'] and not context_includes_test:
+                if not ex["is_train"] and not context_includes_test:
                     continue
-            
+
             context_examples.append(ex)
-        
+
         # If no context examples after filtering, skip this example
         if not context_examples:
             continue
-        
+
         # Sort context examples by example index for consistency
-        context_examples.sort(key=lambda x: x['example_idx'])
-        
+        context_examples.sort(key=lambda x: x["example_idx"])
+
         # Build context tensor
         context_inputs: List[torch.Tensor] = []
         context_outputs: List[torch.Tensor] = []
         for ex in context_examples:
-            context_inputs.append(inputs[ex['global_idx']])
-            context_outputs.append(outputs[ex['global_idx']])
-        
+            context_inputs.append(inputs[ex["global_idx"]])
+            context_outputs.append(outputs[ex["global_idx"]])
+
         # Stack context into shape [n_context, 2, 30, 30, 11]
         if context_inputs:
             context_inputs_tensor = torch.stack(context_inputs)
             context_outputs_tensor = torch.stack(context_outputs)
-            context_tensor = torch.stack([context_inputs_tensor, context_outputs_tensor], dim=1)
+            context_tensor = torch.stack(
+                [context_inputs_tensor, context_outputs_tensor], dim=1
+            )
         else:
             # This shouldn't happen given the check above, but just in case
             context_tensor = torch.empty(0, 2, 30, 30, 11)
-        
+
         # Add to lists
         all_filenames.append(fname)
         all_example_indices.append(example_idx)
         all_input_images.append(inputs[global_idx])
         all_output_images.append(outputs[global_idx])
         all_contexts.append(context_tensor)
-    
+
     if not all_filenames:
         print("Warning: No valid examples found after filtering")
         # Return empty dataloader with custom collate function
         empty_tensors = [
-            torch.empty(0, dtype=torch.long),     # filename indices (placeholder)
-            torch.empty(0, dtype=torch.long),     # example_indices
-            torch.empty(0, 30, 30, 11),          # input_images
-            torch.empty(0, 30, 30, 11),          # output_images
-            torch.empty(0, 0, 2, 30, 30, 11),    # context
+            torch.empty(0, dtype=torch.long),  # filename indices (placeholder)
+            torch.empty(0, dtype=torch.long),  # example_indices
+            torch.empty(0, 30, 30, 11),  # input_images
+            torch.empty(0, 30, 30, 11),  # output_images
+            torch.empty(0, 0, 2, 30, 30, 11),  # context
         ]
         empty_dataset = TensorDataset(*empty_tensors)
-        def empty_collate(x: List[Any]) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            return ([], torch.empty(0, dtype=torch.long), torch.empty(0, 30, 30, 11), torch.empty(0, 30, 30, 11), torch.empty(0, 0, 2, 30, 30, 11))
-        return DataLoader(empty_dataset, batch_size=batch_size, collate_fn=empty_collate)
-    
+
+        def empty_collate(
+            x: List[Any],
+        ) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            return (
+                [],
+                torch.empty(0, dtype=torch.long),
+                torch.empty(0, 30, 30, 11),
+                torch.empty(0, 30, 30, 11),
+                torch.empty(0, 0, 2, 30, 30, 11),
+            )
+
+        return DataLoader(
+            empty_dataset, batch_size=batch_size, collate_fn=empty_collate
+        )
+
     # Convert lists to tensors
     # For filenames, we'll store indices and keep a mapping
     unique_filenames = sorted(set(all_filenames))
     filename_to_idx = {fname: idx for idx, fname in enumerate(unique_filenames)}
-    filename_indices = torch.tensor([filename_to_idx[fname] for fname in all_filenames], dtype=torch.long)
-    
+    filename_indices = torch.tensor(
+        [filename_to_idx[fname] for fname in all_filenames], dtype=torch.long
+    )
+
     example_indices_tensor = torch.tensor(all_example_indices, dtype=torch.long)
     input_images_tensor = torch.stack(all_input_images)
     output_images_tensor = torch.stack(all_output_images)
-    
+
     # Handle variable-length contexts by padding to max length
     max_context_len = max(len(ctx) for ctx in all_contexts) if all_contexts else 0
     padded_contexts: List[torch.Tensor] = []
@@ -907,27 +958,37 @@ def create_shot_dataloader(
         else:
             padded_ctx = ctx
         padded_contexts.append(padded_ctx)
-    
+
     context_tensor = torch.stack(padded_contexts)
-    
+
     print(f"Created dataset with {len(all_filenames)} examples")
     print(f"Unique tasks: {len(unique_filenames)}")
     print(f"Max context size: {max_context_len}")
-    
+
     # Create custom dataset that returns the actual filenames
     class FewShotDataset:
-        def __init__(self, filename_indices: torch.Tensor, example_indices: torch.Tensor, 
-                     inputs: torch.Tensor, outputs: torch.Tensor, contexts: torch.Tensor, 
-                     filenames_list: List[str]):
+        def __init__(
+            self,
+            filename_indices: torch.Tensor,
+            example_indices: torch.Tensor,
+            inputs: torch.Tensor,
+            outputs: torch.Tensor,
+            contexts: torch.Tensor,
+            filenames_list: List[str],
+        ):
             self.filename_indices = filename_indices
             self.example_indices = example_indices
             self.inputs = inputs
             self.outputs = outputs
             self.contexts = contexts
             self.filenames_list = filenames_list
-            self.filename_to_idx = {fname: idx for idx, fname in enumerate(filenames_list)}
-        
-        def __getitem__(self, index: int) -> Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            self.filename_to_idx = {
+                fname: idx for idx, fname in enumerate(filenames_list)
+            }
+
+        def __getitem__(
+            self, index: int
+        ) -> Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             filename_idx = self.filename_indices[index]
             example_idx = self.example_indices[index]
             input_img = self.inputs[index]
@@ -937,19 +998,19 @@ def create_shot_dataloader(
             idx_val = int(filename_idx.item())
             filename = self.filenames_list[idx_val]
             return filename, example_idx, input_img, output_img, context
-        
+
         def __len__(self) -> int:
             return len(self.filename_indices)
-    
+
     dataset = FewShotDataset(
         filename_indices,
         example_indices_tensor,
         input_images_tensor,
         output_images_tensor,
         context_tensor,
-        unique_filenames
+        unique_filenames,
     )
-    
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -960,20 +1021,28 @@ def create_shot_dataloader(
     )
 
 
-def few_shot_collate_fn(batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def few_shot_collate_fn(
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Custom collate function for few-shot learning batches."""
     filenames, example_indices, inputs, outputs, contexts = zip(*batch)
-    
+
     # Convert filenames list to a list (it's already strings)
     filenames_list = list(filenames)
-    
+
     # Stack other tensors normally
     example_indices_tensor = torch.stack(example_indices)
     inputs_tensor = torch.stack(inputs)
     outputs_tensor = torch.stack(outputs)
     contexts_tensor = torch.stack(contexts)
-    
-    return filenames_list, example_indices_tensor, inputs_tensor, outputs_tensor, contexts_tensor
+
+    return (
+        filenames_list,
+        example_indices_tensor,
+        inputs_tensor,
+        outputs_tensor,
+        contexts_tensor,
+    )
 
 
 if __name__ == "__main__":

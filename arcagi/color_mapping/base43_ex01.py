@@ -56,7 +56,7 @@ class AttentionBlock(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
 
         # RoPE if enabled
-        self.rope = RoPE2D(embed_dim, height, width, base=rope_base)
+        self.rope = RoPE2D(self.head_dim, height, width, base=rope_base)
 
         # Normalization layers
         self.norm1 = ArsinhNorm(embed_dim)
@@ -117,9 +117,9 @@ class AttentionBlock(nn.Module):
         return x
 
 
-class MainModuleEx01(MainModule):
+class Ex01(nn.Module):
     def __init__(self, config: TrainingConfigEx01):
-        super().__init__(config)
+        super().__init__()
         # self.config is already set by parent class
         self.input_embed = nn.Linear(45, config.embed_dim)
         self.order2 = Order2Features()
@@ -149,14 +149,22 @@ class MainModuleEx01(MainModule):
         x: input tensor of shape [B, 30, 30, 11]
         """
         batch_size = input_images.shape[0]
-        breakpoint()
-        x1 = self.order2(input_images).view(batch_size, 30 * 30, 45)
+        color_indices = input_images.argmax(dim=-1)  # [B, 30, 30]
+        x1 = self.order2(color_indices).view(batch_size, 30 * 30, 45)
         x2 = self.input_embed(x1)  # [B, 30*30, embed_dim]
         for _ in range(self.num_layers):
             x2 = self.attention_block(x2)
         x2 = self.output_proj(x2)  # [B, 30*30, 11]
         x3 = x2.view(batch_size, 30, 30, 11)
         return x3
+
+
+class MainModuleEx01(MainModule):
+    def __init__(self, config: TrainingConfigEx01):
+        super().__init__(config)
+        self.config = config
+        self.model = Ex01(config)
+        self.save_hyperparameters(config.model_dump())
 
 
 @click.command()

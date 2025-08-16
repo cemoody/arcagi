@@ -243,6 +243,7 @@ def main(training_config: TrainingConfig, ModelClass: Type[MainModule]):
         filename_filter=training_config.filename_filter,
         context_includes_train=True,
         context_includes_test=False,
+        subset="train",  # Only include train examples in training batches
     )
 
     # Create validation dataloader (using same data but no shuffle for now)
@@ -253,6 +254,7 @@ def main(training_config: TrainingConfig, ModelClass: Type[MainModule]):
         filename_filter=training_config.filename_filter,
         context_includes_train=True,
         context_includes_test=True,
+        subset="test",  # Only include test examples in validation batches
     )
 
     # Log dataset statistics

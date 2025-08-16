@@ -96,19 +96,35 @@ class RoPE2D(nn.Module):
         self, x: torch.Tensor, pos: torch.Tensor, height: int, width: int
     ) -> torch.Tensor:
         """Apply 1D rotary embeddings."""
-        # Create position encodings
-        pos_flat = pos.flatten().unsqueeze(1)
-        sincos = torch.einsum("i,j->ij", pos_flat, self.inv_freq)
+        # x shape: [B, seq_len, num_heads, head_dim//2]
+        batch_size, seq_len = x.shape[:2]
+
+        # Create position grid - pos is either [height, 1] or [1, width]
+        # We need to broadcast it to [height, width] then flatten
+        if pos.shape[0] == height and pos.shape[1] == 1:  # Row positions
+            pos_grid = pos.expand(height, width)
+        elif pos.shape[0] == 1 and pos.shape[1] == width:  # Column positions
+            pos_grid = pos.expand(height, width)
+        else:
+            pos_grid = pos
+
+        pos_flat = pos_grid.flatten()  # Shape: [height * width]
+
+        # Compute sin and cos
+        sincos = torch.einsum(
+            "i,j->ij", pos_flat, self.inv_freq
+        )  # [seq_len, inv_freq_len]
         sin, cos = sincos.sin(), sincos.cos()
 
         # Apply rotation
         x_r, x_i = x[..., 0::2], x[..., 1::2]
         x_rotated = torch.zeros_like(x)
-        x_rotated[..., 0::2] = x_r * cos.unsqueeze(0).unsqueeze(
-            2
-        ) - x_i * sin.unsqueeze(0).unsqueeze(2)
-        x_rotated[..., 1::2] = x_r * sin.unsqueeze(0).unsqueeze(
-            2
-        ) + x_i * cos.unsqueeze(0).unsqueeze(2)
+
+        # Reshape sin/cos for broadcasting: [1, seq_len, 1, inv_freq_len]
+        sin = sin.unsqueeze(0).unsqueeze(2)
+        cos = cos.unsqueeze(0).unsqueeze(2)
+
+        x_rotated[..., 0::2] = x_r * cos - x_i * sin
+        x_rotated[..., 1::2] = x_r * sin + x_i * cos
 
         return x_rotated
