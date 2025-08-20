@@ -10,13 +10,14 @@ from arcagi.color_mapping.base43 import TrainingConfig, MainModule, main
 from arcagi.arsinhnorm import ArsinhNorm
 from arcagi.order2 import Order2Features
 from arcagi.positional_embeddings_2d import RoPE2D
+from arcagi.utils.frame_capture import FrameCapture
 
 
 class TrainingConfigEx01(TrainingConfig):
     project_name: str = "arcagi-base43-ex01"
     filename_filter: Optional[str] = "007bbfb7"
 
-    max_epochs: int = 1000
+    max_epochs: int = 10000
 
     # Attention module parameters
     embed_dim: int = 64
@@ -54,6 +55,7 @@ class AttentionBlock(nn.Module):
 
         # Dropout for attention
         self.attn_drop = nn.Dropout(dropout)
+        self.ffn_drop = nn.Dropout(dropout)
 
         # RoPE if enabled
         self.rope = RoPE2D(self.head_dim, height, width, base=rope_base)
@@ -112,7 +114,7 @@ class AttentionBlock(nn.Module):
 
         # FFN with residual
         normed_x = self.norm2(x)
-        x = x + self.ffn(normed_x)
+        x = x + self.ffn_drop(self.ffn(normed_x))
 
         return x
 
@@ -122,6 +124,7 @@ class Ex01(nn.Module):
         super().__init__()
         # self.config is already set by parent class
         self.input_embed = nn.Linear(45, config.embed_dim)
+        self.color_embed = nn.Embedding(11, config.embed_dim)
         self.order2 = Order2Features()
 
         # Create attention block with RoPE support
@@ -136,6 +139,7 @@ class Ex01(nn.Module):
 
         self.output_proj = nn.Linear(config.embed_dim, 11)
         self.num_layers = config.num_attention_layers
+        self.frame_capture = FrameCapture()
 
     def forward(
         self,
@@ -143,6 +147,7 @@ class Ex01(nn.Module):
         filenames: torch.Tensor,
         example_indices: torch.Tensor,
         context: torch.Tensor,
+        current_epoch: int | None = None,
     ) -> torch.Tensor:
         """
         Forward pass using the base model's expected signature.
@@ -151,11 +156,30 @@ class Ex01(nn.Module):
         batch_size = input_images.shape[0]
         color_indices = input_images.argmax(dim=-1)  # [B, 30, 30]
         x1 = self.order2(color_indices).view(batch_size, 30 * 30, 45)
-        x2 = self.input_embed(x1)  # [B, 30*30, embed_dim]
-        for _ in range(self.num_layers):
+        eo = self.input_embed(x1)  # [B, 30*30, embed_dim]
+        ec = self.color_embed(color_indices).view(batch_size, 30 * 30, -1)
+        x2 = eo + ec
+        self.frame_capture.enable()
+        for i in range(self.num_layers):
             x2 = self.attention_block(x2)
-        x2 = self.output_proj(x2)  # [B, 30*30, 11]
-        x3 = x2.view(batch_size, 30, 30, 11)
+            if current_epoch is not None and current_epoch % 10 == 0:
+                x3 = self.project_to_color(x2, round_idx=i)
+        x3 = self.project_to_color(x2)
+
+        if current_epoch is not None and current_epoch % 100 == 0:
+            self.frame_capture.disable()
+            self.frame_capture.to_gif(
+                f"gifs/message_rounds_{current_epoch}.gif", duration_ms=100
+            )
+        return x3
+
+    def project_to_color(
+        self, x2: torch.Tensor, round_idx: int | None = None
+    ) -> torch.Tensor:
+        x2 = self.output_proj(x2)
+        x3 = x2.view(x2.shape[0], 30, 30, 11)
+        if round_idx is not None:
+            self.frame_capture.capture(x3, round_idx=round_idx)
         return x3
 
 

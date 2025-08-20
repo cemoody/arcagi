@@ -33,7 +33,7 @@ class TrainingConfig(BaseModel):
 
     # Training parameters
     max_epochs: int = 1000
-    lr: float = 0.001
+    lr: float = 0.0001
     weight_decay: float = 1e-4
 
     # Checkpoint parameters
@@ -127,6 +127,7 @@ class MainModule(pl.LightningModule):
             filenames=filenames,
             example_indices=example_indices,
             context=context,
+            current_epoch=self.current_epoch,
         )
 
     def step(
@@ -149,6 +150,7 @@ class MainModule(pl.LightningModule):
             filenames=filenames,
             example_indices=example_indices,
             context=context,
+            current_epoch=self.current_epoch,
         )  # [B, 30, 30, 11] logits
 
         # Convert one-hot encoded targets to class indices
